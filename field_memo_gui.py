@@ -35,7 +35,7 @@ class App(tk.Tk):
         super().__init__()
         self.title('Field Memo — Position Deviation Photo Logger')
         self.configure(bg=BG)
-        self.minsize(560, 380)
+        self.minsize(300, 220)
         self.geometry('720x480')
         # Scalable window — unlike the old fixed-size tool, this one resizes freely.
         self.resizable(True, True)
