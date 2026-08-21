@@ -184,18 +184,23 @@ class App(tk.Tk):
                     highest = max(highest, int(m.group(1)))
         return highest + 1
 
-    def _copy_latest(self, pattern, dest_folder, label):
-        src = self._latest_photo(pattern)
-        if not src:
-            self._log(f'✗ No photos found for {label} ({pattern})', 'err')
-            return False
+    def _copy_file(self, src, dest_folder, label, dest_name=None):
+        name = dest_name if dest_name else os.path.basename(src)
         try:
-            shutil.copy2(src, os.path.join(dest_folder, os.path.basename(src)))
-            self._log(f'✓ Copied {label}: {os.path.basename(src)}', 'ok')
+            shutil.copy2(src, os.path.join(dest_folder, name))
+            self._log(f'✓ Copied {label}: {name}', 'ok')
             return True
         except Exception as e:
             self._log(f'✗ Copy failed for {label}: {e}', 'err')
             return False
+
+    def _copy_latest(self, pattern, dest_folder, label, dest_name=None):
+        src = self._latest_photo(pattern)
+        if not src:
+            self._log(f'✗ No photos found for {label} ({pattern})', 'err')
+            return None
+        self._copy_file(src, dest_folder, label, dest_name=dest_name)
+        return src
 
     # ══════════════════════════════════════════
     #  UHD BUTTON CLICK — 2-click event state machine
@@ -240,8 +245,21 @@ class App(tk.Tk):
 
     def _complete_event(self, which):
         folder_path = self.current_folder
-        self._copy_latest(self._uhd_pattern(which), folder_path, f'UHD{which} #2')
-        self._copy_latest(self.fix_image_var.get(), folder_path, 'Fix Image')
+
+        # The UHD "#2" photo is named after the Fix Image (Pre_<fix filename>),
+        # not its own filename — Fix Images use a different "L_..." naming
+        # scheme entirely. Resolve the Fix Image's path ONCE and reuse it for
+        # both the naming and the actual copy below, so the two can't
+        # possibly disagree about which file "the latest Fix Image" was.
+        fix_src = self._latest_photo(self.fix_image_var.get())
+        if fix_src:
+            pre_name = 'Pre_' + os.path.basename(fix_src)
+            self._copy_latest(self._uhd_pattern(which), folder_path, f'UHD{which} #2', dest_name=pre_name)
+            self._copy_file(fix_src, folder_path, 'Fix Image')
+        else:
+            self._log(f'✗ No photos found for Fix Image ({self.fix_image_var.get()})', 'err')
+            self._log('⚠ No Fix Image found — UHD photo kept its own filename', 'w')
+            self._copy_latest(self._uhd_pattern(which), folder_path, f'UHD{which} #2')
 
         if self.reason_win is not None:
             try:
