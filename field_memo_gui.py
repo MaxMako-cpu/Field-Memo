@@ -35,7 +35,7 @@ class App(tk.Tk):
         super().__init__()
         self.title('Field Memo — Position Deviation Photo Logger')
         self.configure(bg=BG)
-        self.minsize(300, 220)
+        self.minsize(190, 170)
         self.geometry('720x480')
         # Scalable window — unlike the old fixed-size tool, this one resizes freely.
         self.resizable(True, True)
@@ -69,31 +69,47 @@ class App(tk.Tk):
         top.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 4))
         tk.Label(top, text='⬡ FIELD MEMO', font=FT, bg=BG, fg=GREEN).pack(side='left')
 
-        # ── paths ──
-        pf = tk.LabelFrame(self, text=' PATHS ', font=FM, bg=BG, fg=FG_DIM,
-                            bd=1, relief='flat', highlightthickness=1,
-                            highlightbackground=BORDER)
-        pf.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 6))
-        pf.columnconfigure(1, weight=1)
+        # ── paths (collapsible — closed by default) ──
+        # Always-visible path rows were the main thing forcing a wide
+        # minimum window (each needs room for a label + an editable path +
+        # a Browse button). Collapsed by default, the everyday view (just
+        # the two UHD buttons + log) can be much smaller; expand only when
+        # you actually need to change a folder.
+        paths_wrap = tk.Frame(self, bg=BG)
+        paths_wrap.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 6))
+        paths_wrap.columnconfigure(0, weight=1)
+
+        self._paths_open = False
+        self.paths_toggle = tk.Button(
+            paths_wrap, text='▶ PATHS', font=FM, bg=PANEL, fg=FG_DIM,
+            relief='flat', bd=0, anchor='w', cursor='hand2',
+            activebackground=BORDER, highlightthickness=1,
+            highlightbackground=BORDER, padx=8, pady=3,
+            command=self._toggle_paths)
+        self.paths_toggle.grid(row=0, column=0, sticky='ew')
+
+        self.paths_body = tk.Frame(paths_wrap, bg=BG)
+        self.paths_body.columnconfigure(1, weight=1)
 
         entries = [
-            ('Fix Images', self.fix_image_var, False),
-            ('UHD333',     self.uhd333_image_var, False),
-            ('UHD334',     self.uhd334_image_var, False),
-            ('Destination', self.dest_folder_var, True),
+            ('Fix Img', self.fix_image_var, False),
+            ('UHD333',  self.uhd333_image_var, False),
+            ('UHD334',  self.uhd334_image_var, False),
+            ('Dest',    self.dest_folder_var, True),
         ]
         for i, (lbl, var, is_dir) in enumerate(entries):
-            tk.Label(pf, text=lbl, font=FM, bg=BG, fg=FG_DIM, anchor='w', width=11
-                      ).grid(row=i, column=0, sticky='w', padx=(8, 2), pady=3)
-            tk.Entry(pf, textvariable=var, font=FM, bg=PANEL, fg=FG,
+            tk.Label(self.paths_body, text=lbl, font=FM, bg=BG, fg=FG_DIM,
+                      anchor='w', width=7
+                      ).grid(row=i, column=0, sticky='w', padx=(2, 2), pady=3)
+            tk.Entry(self.paths_body, textvariable=var, font=FM, bg=PANEL, fg=FG,
                       insertbackground=FG, relief='flat', bd=0,
                       highlightthickness=1, highlightcolor=GREEN,
                       highlightbackground=BORDER
                       ).grid(row=i, column=1, sticky='ew', pady=3)
-            tk.Button(pf, text='…', font=FM, bg=BORDER, fg=FG, relief='flat',
+            tk.Button(self.paths_body, text='…', font=FM, bg=BORDER, fg=FG, relief='flat',
                       bd=0, cursor='hand2', padx=6,
                       command=lambda v=var, d=is_dir: self._browse(v, d)
-                      ).grid(row=i, column=2, padx=(4, 8), pady=3)
+                      ).grid(row=i, column=2, padx=(4, 2), pady=3)
 
         # ── log ──
         lf = tk.Frame(self, bg=BG)
@@ -135,6 +151,15 @@ class App(tk.Tk):
         tk.Button(self, text='CLR LOG', font=FM, bg=BORDER, fg=FG_DIM,
                   relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
                   command=self._clear_log).grid(row=4, column=0, sticky='e', padx=10, pady=(0, 8))
+
+    def _toggle_paths(self):
+        self._paths_open = not self._paths_open
+        if self._paths_open:
+            self.paths_toggle.configure(text='▼ PATHS')
+            self.paths_body.grid(row=1, column=0, sticky='ew', pady=(4, 0))
+        else:
+            self.paths_toggle.configure(text='▶ PATHS')
+            self.paths_body.grid_forget()
 
     # ══════════════════════════════════════════
     #  LOG
