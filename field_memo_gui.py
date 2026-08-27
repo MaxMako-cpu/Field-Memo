@@ -1,6 +1,7 @@
 import os
 import re
 import glob
+import json
 import shutil
 import zipfile
 import xml.etree.ElementTree as ET
@@ -23,6 +24,10 @@ EVENT_LABEL = 'Position deviation'   # folder name middle segment: FM-055-Positi
 # event photos (in place, same zip path — no new library needed) and removes
 # Figure 4's picture entirely (left blank for manual insertion later).
 REPORT_TEMPLATE = 'IFR-PXGEO-OBN-013626-.docx'
+
+# Remembers the 4 path fields across restarts — plain JSON next to the
+# script, written on every change (see App._save_config()).
+CONFIG_FILENAME = 'field_memo_config.json'
 
 # OOXML namespaces used when editing the report's word/document.xml
 NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -56,10 +61,14 @@ class App(tk.Tk):
         # Scalable window — unlike the old fixed-size tool, this one resizes freely.
         self.resizable(True, True)
 
-        self.fix_image_var    = tk.StringVar(value=DEFAULT_FIX_IMAGE)
-        self.uhd333_image_var = tk.StringVar(value=DEFAULT_UHD333_IMAGE)
-        self.uhd334_image_var = tk.StringVar(value=DEFAULT_UHD334_IMAGE)
-        self.dest_folder_var  = tk.StringVar(value=DEFAULT_DEST_FOLDER)
+        cfg = self._load_config()
+        self.fix_image_var    = tk.StringVar(value=cfg.get('fix_image', DEFAULT_FIX_IMAGE))
+        self.uhd333_image_var = tk.StringVar(value=cfg.get('uhd333_image', DEFAULT_UHD333_IMAGE))
+        self.uhd334_image_var = tk.StringVar(value=cfg.get('uhd334_image', DEFAULT_UHD334_IMAGE))
+        self.dest_folder_var  = tk.StringVar(value=cfg.get('dest_folder', DEFAULT_DEST_FOLDER))
+        for var in (self.fix_image_var, self.uhd333_image_var,
+                    self.uhd334_image_var, self.dest_folder_var):
+            var.trace_add('write', lambda *args: self._save_config())
 
         # ── event state machine ──
         # active_uhd: None | "333" | "334" — which button (if any) is armed,
@@ -151,27 +160,28 @@ class App(tk.Tk):
         bot.columnconfigure(1, weight=1)
 
         self.btn_uhd333 = tk.Button(
-            bot, text='UHD333', font=FB, bg=PANEL, fg=FG,
+            bot, text='UHD333', font=FB, bg=PANEL, fg=RED,
             activebackground=BORDER, relief='flat', bd=0, cursor='hand2',
             pady=10, command=lambda: self._on_uhd_click('333'))
         self.btn_uhd333.grid(row=0, column=0, sticky='ew', padx=(0, 4))
 
         self.btn_uhd334 = tk.Button(
-            bot, text='UHD334', font=FB, bg=PANEL, fg=FG,
+            bot, text='UHD334', font=FB, bg=PANEL, fg=GREEN,
             activebackground=BORDER, relief='flat', bd=0, cursor='hand2',
             pady=10, command=lambda: self._on_uhd_click('334'))
         self.btn_uhd334.grid(row=0, column=1, sticky='ew', padx=(4, 0))
 
         self._buttons = {'333': self.btn_uhd333, '334': self.btn_uhd334}
+        self._idle_fg = {'333': RED, '334': GREEN}  # each button's label color when not flashing
 
         bottom_row = tk.Frame(self, bg=BG)
         bottom_row.grid(row=4, column=0, sticky='ew', padx=10, pady=(0, 8))
         bottom_row.columnconfigure(0, weight=1)  # spacer — pushes both buttons to the right
 
-        tk.Button(bottom_row, text='GENERATE REPORT', font=FM, bg=YELLOW, fg='#000',
+        tk.Button(bottom_row, text='GENERATE REPORT', font=FM, bg=BORDER, fg=YELLOW,
                   relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
                   command=self._generate_report).grid(row=0, column=1, padx=(0, 6))
-        tk.Button(bottom_row, text='CLR LOG', font=FM, bg=BORDER, fg=FG_DIM,
+        tk.Button(bottom_row, text='CLR LOG', font=FM, bg=BORDER, fg='#ffffff',
                   relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
                   command=self._clear_log).grid(row=0, column=2)
 
@@ -197,6 +207,35 @@ class App(tk.Tk):
         self.log_box.configure(state='normal')
         self.log_box.delete('1.0', 'end')
         self.log_box.configure(state='disabled')
+
+    # ══════════════════════════════════════════
+    #  SETTINGS PERSISTENCE
+    # ══════════════════════════════════════════
+    def _config_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)
+
+    def _load_config(self):
+        path = self._config_path()
+        if os.path.isfile(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def _save_config(self):
+        data = {
+            'fix_image':    self.fix_image_var.get(),
+            'uhd333_image': self.uhd333_image_var.get(),
+            'uhd334_image': self.uhd334_image_var.get(),
+            'dest_folder':  self.dest_folder_var.get(),
+        }
+        try:
+            with open(self._config_path(), 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass  # best-effort — a failed save shouldn't interrupt the tool
 
     # ══════════════════════════════════════════
     #  BROWSE
@@ -330,8 +369,8 @@ class App(tk.Tk):
         self._buttons[other].configure(state='disabled')
 
     def _enable_both_buttons(self):
-        for btn in self._buttons.values():
-            btn.configure(state='normal', bg=PANEL, fg=FG)
+        for key, btn in self._buttons.items():
+            btn.configure(state='normal', bg=PANEL, fg=self._idle_fg[key])
 
     def _start_flash(self, which):
         self._flash_on = False
@@ -343,14 +382,14 @@ class App(tk.Tk):
         if self._flash_on:
             btn.configure(bg=GREEN, fg='#000')
         else:
-            btn.configure(bg=PANEL, fg=FG)
+            btn.configure(bg=PANEL, fg=self._idle_fg[which])
         self._flash_job = self.after(FLASH_INTERVAL_MS, lambda: self._do_flash(which))
 
     def _stop_flash(self, which):
         if self._flash_job is not None:
             self.after_cancel(self._flash_job)
             self._flash_job = None
-        self._buttons[which].configure(bg=PANEL, fg=FG)
+        self._buttons[which].configure(bg=PANEL, fg=self._idle_fg[which])
 
     # ══════════════════════════════════════════
     #  REASON PROMPT — non-modal, doesn't block clicking the flashing button
