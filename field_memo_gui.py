@@ -2,6 +2,8 @@ import os
 import re
 import glob
 import shutil
+import zipfile
+import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog
 
@@ -15,6 +17,19 @@ DEFAULT_DEST_FOLDER  = 'Z:/Projects/OBN013626_SLB_USA_Engagement10/04_SURVEY/01.
 
 EVENT_LABEL = 'Position deviation'   # folder name middle segment: FM-055-Position deviation[-reason]
 
+# Report template — kept next to this script. Its 4 "Figure N" captions each
+# already have a placeholder picture embedded right before them in the
+# template; Generate Report swaps Figures 1-3's picture bytes for the 3 real
+# event photos (in place, same zip path — no new library needed) and removes
+# Figure 4's picture entirely (left blank for manual insertion later).
+REPORT_TEMPLATE = 'IFR-PXGEO-OBN-013626-.docx'
+
+# OOXML namespaces used when editing the report's word/document.xml
+NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+DOCX_NS = {'w': NS_W, 'a': NS_A, 'r': NS_R}
+
 BG      = '#0d0f14'
 PANEL   = '#13161e'
 BORDER  = '#1e2330'
@@ -23,6 +38,7 @@ FG_DIM  = '#4a5270'
 GREEN   = '#00e676'
 AMBER   = '#ffb300'
 RED     = '#ff1744'
+YELLOW  = '#ffd600'   # Generate Report button — distinct from AMBER's warning connotation
 FM      = ('Courier New', 9)
 FB      = ('Courier New', 11, 'bold')
 FT      = ('Courier New', 12, 'bold')
@@ -148,9 +164,16 @@ class App(tk.Tk):
 
         self._buttons = {'333': self.btn_uhd333, '334': self.btn_uhd334}
 
-        tk.Button(self, text='CLR LOG', font=FM, bg=BORDER, fg=FG_DIM,
+        bottom_row = tk.Frame(self, bg=BG)
+        bottom_row.grid(row=4, column=0, sticky='ew', padx=10, pady=(0, 8))
+        bottom_row.columnconfigure(0, weight=1)  # spacer — pushes both buttons to the right
+
+        tk.Button(bottom_row, text='GENERATE REPORT', font=FM, bg=YELLOW, fg='#000',
                   relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
-                  command=self._clear_log).grid(row=4, column=0, sticky='e', padx=10, pady=(0, 8))
+                  command=self._generate_report).grid(row=0, column=1, padx=(0, 6))
+        tk.Button(bottom_row, text='CLR LOG', font=FM, bg=BORDER, fg=FG_DIM,
+                  relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
+                  command=self._clear_log).grid(row=0, column=2)
 
     def _toggle_paths(self):
         self._paths_open = not self._paths_open
@@ -390,6 +413,148 @@ class App(tk.Tk):
             self._log(f'✓ Renamed to {new_name}', 'ok')
         except Exception as e:
             self._log(f'✗ Could not rename folder: {e}', 'err')
+
+    # ══════════════════════════════════════════
+    #  GENERATE REPORT
+    # ══════════════════════════════════════════
+    def _latest_event_folder(self, dest_root):
+        """Return (path, name) of the highest-numbered existing
+        'FM-###-...' folder in dest_root, or (None, None)."""
+        best_num, best_name = -1, None
+        if os.path.isdir(dest_root):
+            for name in os.listdir(dest_root):
+                m = re.match(r'FM-(\d+)-', name)
+                if m and int(m.group(1)) > best_num:
+                    best_num, best_name = int(m.group(1)), name
+        if best_name is None:
+            return None, None
+        return os.path.join(dest_root, best_name), best_name
+
+    def _identify_event_photos(self, folder_path):
+        """Identify (photo1, photo2, fix_photo) among the files already in
+        an event folder, using the naming convention _complete_event() set
+        up: photo2 is the file prefixed 'Pre_', the fix photo is that same
+        name minus the prefix, and whatever's left over is photo1. Any of
+        the three may come back None if it can't be determined."""
+        files = [f for f in os.listdir(folder_path)
+                 if os.path.isfile(os.path.join(folder_path, f))]
+
+        pre_file = next((f for f in files if f.startswith('Pre_')), None)
+        fix_file = None
+        if pre_file:
+            candidate = pre_file[len('Pre_'):]
+            if candidate in files:
+                fix_file = candidate
+
+        remaining = [f for f in files if f not in (pre_file, fix_file)]
+        if len(remaining) > 1:
+            remaining.sort(key=lambda f: os.path.getctime(os.path.join(folder_path, f)))
+        photo1_file = remaining[0] if remaining else None
+
+        def full(f):
+            return os.path.join(folder_path, f) if f else None
+        return full(photo1_file), full(pre_file), full(fix_file)
+
+    # ---- docx editing helpers (pure zipfile/ElementTree — no extra library) ----
+    def _docx_rel_map(self, docx_path):
+        with zipfile.ZipFile(docx_path) as z:
+            rels_xml = z.read('word/_rels/document.xml.rels').decode('utf-8')
+        rel_root = ET.fromstring(rels_xml)
+        return {rel.get('Id'): rel.get('Target') for rel in rel_root}
+
+    def _docx_figure_rid(self, root, caption_substr):
+        """Relationship id of the picture immediately preceding the
+        paragraph whose text contains caption_substr (e.g. 'Figure 2')."""
+        body = root.find('w:body', DOCX_NS)
+        paras = list(body.iter('{%s}p' % NS_W))
+        for i, p in enumerate(paras):
+            texts = ''.join(t.text or '' for t in p.findall('.//w:t', DOCX_NS))
+            if caption_substr in texts:
+                for j in range(i - 1, -1, -1):
+                    blip = paras[j].find('.//a:blip', DOCX_NS)
+                    if blip is not None:
+                        return blip.get('{%s}embed' % NS_R)
+                return None
+        return None
+
+    def _docx_run_span_for_rid(self, xml_text, rid):
+        """Offsets (start, end) of the whole <w:r>...</w:r> run that embeds
+        the picture with the given relationship id, for surgical removal."""
+        idx = xml_text.find(f'r:embed="{rid}"')
+        if idx < 0:
+            return None
+        draw_start = xml_text.rfind('<w:drawing', 0, idx)
+        draw_end = xml_text.find('</w:drawing>', idx) + len('</w:drawing>')
+        run_start = max(xml_text.rfind('<w:r>', 0, draw_start), xml_text.rfind('<w:r ', 0, draw_start))
+        run_end = xml_text.find('</w:r>', draw_end) + len('</w:r>')
+        return run_start, run_end
+
+    def _build_report(self, template_path, out_path, photo1, photo2, fix_photo):
+        with zipfile.ZipFile(template_path) as z:
+            doc_xml_bytes = z.read('word/document.xml')
+        rel_map = self._docx_rel_map(template_path)
+        root = ET.fromstring(doc_xml_bytes)
+
+        fig_rid = {n: self._docx_figure_rid(root, f'Figure {n}') for n in (1, 2, 3, 4)}
+        doc_xml_text = doc_xml_bytes.decode('utf-8')
+
+        # Figure 4 — remove its picture entirely, left blank for manual
+        # insertion later (per instruction: do not insert anything there).
+        rid4 = fig_rid.get(4)
+        if rid4:
+            span = self._docx_run_span_for_rid(doc_xml_text, rid4)
+            if span:
+                doc_xml_text = doc_xml_text[:span[0]] + doc_xml_text[span[1]:]
+
+        # Figures 1-3 — swap each placeholder picture's bytes for the real
+        # event photo, keeping the same zip path so the template's existing
+        # relationships/sizing/captions stay untouched.
+        photos = {1: photo1, 2: photo2, 3: fix_photo}
+        targets_to_replace = {}
+        for n in (1, 2, 3):
+            rid, src = fig_rid.get(n), photos.get(n)
+            if rid and src and rel_map.get(rid):
+                with open(src, 'rb') as f:
+                    targets_to_replace['word/' + rel_map[rid]] = f.read()
+
+        with zipfile.ZipFile(template_path) as zin, \
+             zipfile.ZipFile(out_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == 'word/document.xml':
+                    zout.writestr(item, doc_xml_text.encode('utf-8'))
+                elif item.filename in targets_to_replace:
+                    zout.writestr(item, targets_to_replace[item.filename])
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+
+    def _generate_report(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        template_path = os.path.join(script_dir, REPORT_TEMPLATE)
+        if not os.path.isfile(template_path):
+            self._log(f'✗ Report template not found next to the script: {REPORT_TEMPLATE}', 'err')
+            return
+
+        dest_root = self.dest_folder_var.get()
+        folder_path, folder_name = self._latest_event_folder(dest_root)
+        if not folder_path:
+            self._log('✗ No FM-### event folder found in Destination', 'err')
+            return
+
+        photo1, photo2, fix_photo = self._identify_event_photos(folder_path)
+        if not (photo1 and photo2 and fix_photo):
+            self._log(f'⚠ Could not identify all 3 photos in {folder_name} — '
+                       f'report will leave any unmatched figure as the template default', 'w')
+
+        m = re.match(r'(FM-\d+)', folder_name)
+        fm_id = m.group(1) if m else folder_name
+        base, ext = os.path.splitext(REPORT_TEMPLATE)
+        out_path = os.path.join(folder_path, f'{base}{fm_id}{ext}')
+
+        try:
+            self._build_report(template_path, out_path, photo1, photo2, fix_photo)
+            self._log(f'✓ Generated report: {os.path.basename(out_path)}', 'ok')
+        except Exception as e:
+            self._log(f'✗ Report generation failed: {e}', 'err')
 
 
 if __name__ == '__main__':
