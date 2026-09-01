@@ -186,9 +186,12 @@ class App(tk.Tk):
         tk.Button(bottom_row, text='GENERATE REPORT', font=FM, bg=BORDER, fg=YELLOW,
                   relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
                   command=self._generate_report).grid(row=0, column=1, padx=(0, 6))
+        tk.Button(bottom_row, text='TEMPLATES', font=FM, bg=BORDER, fg=AMBER,
+                  relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
+                  command=self._open_template_editor).grid(row=0, column=2, padx=(0, 6))
         tk.Button(bottom_row, text='CLR LOG', font=FM, bg=BORDER, fg='#ffffff',
                   relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
-                  command=self._clear_log).grid(row=0, column=2)
+                  command=self._clear_log).grid(row=0, column=3)
 
     def _toggle_paths(self):
         self._paths_open = not self._paths_open
@@ -1021,22 +1024,13 @@ class App(tk.Tk):
         except Exception as e:
             self._log(f'✗ Report generation failed: {e}', 'err')
 
-    def _open_template_manager(self, report_path, folder_path):
-        """Open template manager window for adding templates to the report."""
-        win = tk.Toplevel(self)
-        win.title('Template Manager')
-        win.configure(bg=BG)
-        win.geometry('640x680')
-        win.minsize(480, 500)
-        win.transient(self)
-
-        # Extract FM number from folder path
-        fm_number = self._extract_fm_number(folder_path)
-
-        # ── Title ──
-        tk.Label(win, text='Engagement 10 Templates & Metadata', font=FB, bg=BG, fg=GREEN).pack(padx=12, pady=(12, 6), anchor='w')
-
-        # ── Templates — one button per saved template ──
+    def _build_template_picker(self, parent, insert_hint=True):
+        """Build the templates section (buttons + editable text box +
+        Add/Update/Delete) inside `parent`. Shared by the full Template
+        Manager (opened after Generate Report) and the standalone Manage
+        Templates window, so both stay in sync. Returns the Text widget so
+        a caller that needs the current text (e.g. Insert & Close) can
+        read it with editor.get('1.0', 'end-1c')."""
         # templates: list of {'name': short label shown on the button, 'text': saved body}.
         # selected['index'] tracks which template is currently loaded into the
         # editor below, so Update/Delete know which one to act on.
@@ -1045,10 +1039,11 @@ class App(tk.Tk):
         template_buttons = []
         TEMPLATES_PER_ROW = 4
 
-        tk.Label(win, text='Templates — click to load, edit freely below, then Insert:',
+        hint = 'click to load, edit freely below, then Insert:' if insert_hint else 'click to load, edit freely below:'
+        tk.Label(parent, text=f'Templates — {hint}',
                  font=FM, bg=BG, fg=FG_DIM).pack(padx=12, pady=(6, 2), anchor='w')
 
-        buttons_wrap = tk.Frame(win, bg=BG)
+        buttons_wrap = tk.Frame(parent, bg=BG)
         buttons_wrap.pack(fill='x', padx=12, pady=(0, 4))
 
         def highlight_selected():
@@ -1082,7 +1077,7 @@ class App(tk.Tk):
 
         def add_template():
             name = simpledialog.askstring(
-                'New Template', 'Short name (e.g. "Slope", "Benthic"):', parent=win)
+                'New Template', 'Short name (e.g. "Slope", "Benthic"):', parent=parent)
             if not name or not name.strip():
                 return
             templates.append({'name': name.strip(), 'text': ''})
@@ -1112,17 +1107,17 @@ class App(tk.Tk):
             rebuild_template_buttons()
             self._log(f'✓ Template "{name}" deleted', 'ok')
 
-        tk.Button(win, text='+ Add Template', font=FM, bg=GREEN, fg='#000', relief='flat',
+        tk.Button(parent, text='+ Add Template', font=FM, bg=GREEN, fg='#000', relief='flat',
                   bd=0, cursor='hand2', padx=10, pady=3,
                   command=add_template).pack(padx=12, pady=(0, 6), anchor='w')
 
         # ── Editable template text — a real multi-line Text widget, so
         # Enter starts a new paragraph here exactly like it will in Word,
         # instead of the single-line Entry that could only hold one line. ──
-        tk.Label(win, text='Template Text (Enter = new paragraph in the report):',
+        tk.Label(parent, text='Template Text (Enter = new paragraph in the report):',
                  font=FM, bg=BG, fg=FG_DIM).pack(padx=12, pady=(6, 2), anchor='w')
 
-        editor_frame = tk.Frame(win, bg=BG)
+        editor_frame = tk.Frame(parent, bg=BG)
         editor_frame.pack(fill='both', expand=True, padx=12, pady=(0, 6))
         editor_scroll = tk.Scrollbar(editor_frame, bg=BORDER, troughcolor=BG, relief='flat')
         editor_scroll.pack(side='right', fill='y')
@@ -1133,7 +1128,7 @@ class App(tk.Tk):
         editor.pack(side='left', fill='both', expand=True)
         editor_scroll.config(command=editor.yview)
 
-        edit_btn_row = tk.Frame(win, bg=BG)
+        edit_btn_row = tk.Frame(parent, bg=BG)
         edit_btn_row.pack(fill='x', padx=12, pady=(0, 6))
         tk.Button(edit_btn_row, text='Update Template', font=FM, bg=BORDER, fg=YELLOW, relief='flat',
                   bd=0, cursor='hand2', padx=10, command=update_template).pack(side='left', padx=(0, 3))
@@ -1141,6 +1136,43 @@ class App(tk.Tk):
                   bd=0, cursor='hand2', padx=10, command=delete_template).pack(side='left', padx=3)
 
         rebuild_template_buttons()
+        return editor
+
+    def _open_template_editor(self):
+        """Standalone Manage Templates window, reachable from the main GUI
+        without needing to run Generate Report first."""
+        win = tk.Toplevel(self)
+        win.title('Manage Templates')
+        win.configure(bg=BG)
+        win.geometry('600x560')
+        win.minsize(420, 420)
+        win.transient(self)
+
+        tk.Label(win, text='Manage Templates', font=FB, bg=BG, fg=GREEN).pack(padx=12, pady=(12, 6), anchor='w')
+
+        self._build_template_picker(win, insert_hint=False)
+
+        btn_row = tk.Frame(win, bg=BG)
+        btn_row.pack(fill='x', padx=12, pady=(0, 12))
+        tk.Button(btn_row, text='Close', font=FM, bg=GREEN, fg='#000', relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=win.destroy).pack(side='right')
+
+    def _open_template_manager(self, report_path, folder_path):
+        """Open template manager window for adding templates to the report."""
+        win = tk.Toplevel(self)
+        win.title('Template Manager')
+        win.configure(bg=BG)
+        win.geometry('640x680')
+        win.minsize(480, 500)
+        win.transient(self)
+
+        # Extract FM number from folder path
+        fm_number = self._extract_fm_number(folder_path)
+
+        # ── Title ──
+        tk.Label(win, text='Engagement 10 Templates & Metadata', font=FB, bg=BG, fg=GREEN).pack(padx=12, pady=(12, 6), anchor='w')
+
+        editor = self._build_template_picker(win)
 
         # ── Metadata Fields ──
         meta_frame = tk.LabelFrame(win, text='Document Metadata', font=FM, bg=BG, fg=FG_DIM, relief='flat', bd=0)
