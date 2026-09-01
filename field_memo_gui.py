@@ -767,7 +767,15 @@ class App(tk.Tk):
             text_el = ET.SubElement(run, '{%s}t' % NS_W)
             text_el.text = template_text
 
-            body.insert(list(body).index(insert_after_table) + 1, new_para)
+            # A blank spacer paragraph between the table and the template
+            # text, so it doesn't sit flush against the table border.
+            spacer_para = ET.Element('{%s}p' % NS_W)
+            spacer_pPr = ET.SubElement(spacer_para, '{%s}pPr' % NS_W)
+            ET.SubElement(spacer_pPr, '{%s}pStyle' % NS_W).set('{%s}val' % NS_W, 'Normal')
+
+            insert_idx = list(body).index(insert_after_table) + 1
+            body.insert(insert_idx, spacer_para)
+            body.insert(insert_idx + 1, new_para)
 
             updated_xml = ET.tostring(root, encoding='utf-8')
             with zipfile.ZipFile(docx_path, 'r') as zin, zipfile.ZipFile(docx_path + '.tmp', 'w', zipfile.ZIP_DEFLATED) as zout:
