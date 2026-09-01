@@ -223,16 +223,33 @@ class App(tk.Tk):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), TEMPLATES_FILENAME)
 
     def _load_templates(self):
-        """Load templates from JSON file."""
+        """Load templates from JSON file, normalizing legacy entries.
+
+        Templates used to be saved as plain strings (label == full text).
+        Loading one of those as templates[i]['name'] raises "string indices
+        must be integers, not 'str'" — coerce each entry into the current
+        {'name', 'text'} shape instead of assuming the file is already new."""
         path = self._templates_path()
-        if os.path.isfile(path):
-            try:
-                with open(path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data.get('templates', [])
-            except Exception:
-                pass
-        return []
+        if not os.path.isfile(path):
+            return []
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                raw = data.get('templates', [])
+        except Exception:
+            return []
+
+        templates = []
+        for i, item in enumerate(raw):
+            if isinstance(item, dict):
+                templates.append({'name': item.get('name') or f'Template {i + 1}',
+                                   'text': item.get('text', '')})
+            else:
+                text = str(item)
+                first_line = text.strip().splitlines()[0] if text.strip() else ''
+                name = (first_line[:24] + '…') if len(first_line) > 24 else first_line
+                templates.append({'name': name or f'Template {i + 1}', 'text': text})
+        return templates
 
     def _save_templates(self, templates):
         """Save templates to JSON file."""
@@ -1216,6 +1233,12 @@ class App(tk.Tk):
         browse_btn = tk.Button(btn_frame, text='Browse & Insert Image', font=FM, bg=BORDER, fg=YELLOW, relief='flat',
                   bd=0, cursor='hand2', padx=10, command=browse_image)
         browse_btn.pack(side='left', padx=3)
+
+        # An explicit, always-available way out — previously the only exits
+        # were completing Insert & Close or finding the window's own OS
+        # close button, which left the window feeling like a dead end.
+        tk.Button(btn_frame, text='Cancel', font=FM, bg=BORDER, fg=FG, relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=win.destroy).pack(side='right', padx=(0, 6))
 
         tk.Button(btn_frame, text='Insert & Close', font=FM, bg=GREEN, fg='#000', relief='flat',
                   bd=0, cursor='hand2', padx=10, command=insert_template).pack(side='right')
