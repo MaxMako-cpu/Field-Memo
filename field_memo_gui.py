@@ -7,6 +7,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 import tkinter as tk
 from tkinter import filedialog
+from datetime import datetime
 
 # ─────────────────────────────────────────────
 #  DEFAULT PATHS
@@ -28,6 +29,9 @@ REPORT_TEMPLATE = 'IFR-PXGEO-OBN-013626-.docx'
 # Remembers the 4 path fields across restarts — plain JSON next to the
 # script, written on every change (see App._save_config()).
 CONFIG_FILENAME = 'field_memo_config.json'
+
+# Templates for text insertion under the Engagement 10 Position Deviation table
+TEMPLATES_FILENAME = 'field_memo_templates.json'
 
 # OOXML namespaces used when editing the report's word/document.xml
 NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -79,6 +83,7 @@ class App(tk.Tk):
         self.reason_win     = None
         self._flash_job      = None
         self._flash_on       = False
+        self.current_report_path = None  # Stores path to generated report for template insertion
 
         self._build_ui()
 
@@ -213,6 +218,43 @@ class App(tk.Tk):
     # ══════════════════════════════════════════
     def _config_path(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), CONFIG_FILENAME)
+
+    def _templates_path(self):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), TEMPLATES_FILENAME)
+
+    def _load_templates(self):
+        """Load templates from JSON file."""
+        path = self._templates_path()
+        if os.path.isfile(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return data.get('templates', [])
+            except Exception:
+                pass
+        return []
+
+    def _save_templates(self, templates):
+        """Save templates to JSON file."""
+        data = {'templates': templates}
+        try:
+            with open(self._templates_path(), 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self._log(f'✗ Could not save templates: {e}', 'err')
+
+    def _extract_fm_number(self, folder_path):
+        """Extract FM number from folder path (e.g., FM-001 from 'FM-001-Position deviation')."""
+        folder_name = os.path.basename(folder_path)
+        m = re.match(r'(FM-\d+)', folder_name)
+        if m:
+            return m.group(1).replace('FM-', '')  # Return just the number part (001)
+        return '000'
+
+    def _get_formatted_date(self):
+        """Get current system date in Day/Month/Year format."""
+        today = datetime.now()
+        return today.strftime('%d/%m/%Y')
 
     def _load_config(self):
         path = self._config_path()
@@ -566,6 +608,329 @@ class App(tk.Tk):
                 else:
                     zout.writestr(item, zin.read(item.filename))
 
+    def _insert_template_into_docx(self, docx_path, template_text, fm_number, line_num, station_num, node_num, author):
+        """Update the actual placeholders in the template and insert the template text."""
+        try:
+            ET.register_namespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main')
+            ET.register_namespace('r', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships')
+            ET.register_namespace('a', 'http://schemas.openxmlformats.org/drawingml/2006/main')
+            ET.register_namespace('wp', 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing')
+            ET.register_namespace('v', 'urn:schemas-microsoft-com:vml')
+
+            def set_font_12(run, bold=False):
+                rpr = run.find('{%s}rPr' % NS_W)
+                if rpr is None:
+                    rpr = ET.SubElement(run, '{%s}rPr' % NS_W)
+                fonts = rpr.find('{%s}rFonts' % NS_W)
+                if fonts is None:
+                    fonts = ET.SubElement(rpr, '{%s}rFonts' % NS_W)
+                fonts.set('{%s}ascii' % NS_W, 'Arial')
+                fonts.set('{%s}hAnsi' % NS_W, 'Arial')
+                fonts.set('{%s}eastAsia' % NS_W, 'Arial')
+                if bold:
+                    if rpr.find('{%s}b' % NS_W) is None:
+                        ET.SubElement(rpr, '{%s}b' % NS_W)
+                    if rpr.find('{%s}bCs' % NS_W) is None:
+                        ET.SubElement(rpr, '{%s}bCs' % NS_W)
+                else:
+                    for tag in ('{%s}b' % NS_W, '{%s}bCs' % NS_W):
+                        el = rpr.find(tag)
+                        if el is not None:
+                            rpr.remove(el)
+                sz = rpr.find('{%s}sz' % NS_W)
+                if sz is None:
+                    sz = ET.SubElement(rpr, '{%s}sz' % NS_W)
+                sz.set('{%s}val' % NS_W, '24')
+                szcs = rpr.find('{%s}szCs' % NS_W)
+                if szcs is None:
+                    szcs = ET.SubElement(rpr, '{%s}szCs' % NS_W)
+                szcs.set('{%s}val' % NS_W, '24')
+
+            def replace_paragraph_text(paragraph, new_text, bold=False):
+                for child in list(paragraph):
+                    if child.tag != '{%s}pPr' % NS_W:
+                        paragraph.remove(child)
+                run = ET.SubElement(paragraph, '{%s}r' % NS_W)
+                set_font_12(run, bold=bold)
+                text_el = ET.SubElement(run, '{%s}t' % NS_W)
+                if new_text and (new_text[0].isspace() or new_text[-1].isspace() or '  ' in new_text):
+                    text_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                text_el.text = new_text
+
+            def replace_cell_text(cell, new_text, bold=False):
+                # Keep the first existing paragraph's pPr (indent, cnfStyle
+                # table-banding) so the inserted text stays aligned with the
+                # other rows instead of landing flush-left — matching
+                # IFR-PXGEO-OBN-013626-FM-074.docx.
+                keep_pPr = None
+                for para in list(cell):
+                    if para.tag == '{%s}p' % NS_W:
+                        if keep_pPr is None:
+                            keep_pPr = para.find('{%s}pPr' % NS_W)
+                        cell.remove(para)
+                para = ET.Element('{%s}p' % NS_W)
+                if keep_pPr is not None:
+                    para.append(keep_pPr)
+                cell.append(para)
+                replace_paragraph_text(para, new_text, bold=bold)
+
+            with zipfile.ZipFile(docx_path, 'r') as z:
+                doc_xml_bytes = z.read('word/document.xml')
+
+            root = ET.fromstring(doc_xml_bytes)
+            body = root.find('w:body', DOCX_NS)
+            if body is None:
+                self._log('✗ Cannot find document body in Word file', 'err')
+                return False
+
+            current_date = self._get_formatted_date()
+            day_str, month_str, year_str = current_date.split('/')
+            line_text = str(int(line_num))
+            station_text = str(int(station_num))
+            node_text = str(int(node_num))
+
+            # Edit only the placeholder runs' text in place, so the template's
+            # existing tabs / bold / right-alignment (e.g. the tab-aligned
+            # "REVISION 1" next to the title, or the tabs that right-align the
+            # date) survive untouched — matching IFR-PXGEO-OBN-013626-FM-074.docx.
+            for para in body.iter('{%s}p' % NS_W):
+                t_elems = para.findall('.//w:t', DOCX_NS)
+                txt = ''.join(t.text or '' for t in t_elems)
+                if 'IFR-PXGEO-OBN-013626-' in txt and 'REVISION' in txt:
+                    for t in t_elems:
+                        if t.text and 'IFR-PXGEO-OBN-013626-' in t.text:
+                            t.text = t.text.replace(
+                                'IFR-PXGEO-OBN-013626-',
+                                f'IFR-PXGEO-OBN-013626-FM-{fm_number}',
+                            )
+                            break
+                elif txt.strip() == 'Day/Month/Year' or ('Day' in txt and 'Month' in txt and 'Year' in txt):
+                    for t in t_elems:
+                        if t.text == 'Day':
+                            t.text = day_str
+                        elif t.text == 'Month':
+                            t.text = month_str
+                        elif t.text == 'Year':
+                            t.text = year_str
+                elif 'Line ' in txt and 'Station ' in txt and 'Node ' in txt and 'Engagement 10 Position Deviation' in txt:
+                    placeholders = [t for t in t_elems if t.text == 'XXX']
+                    for t, value in zip(placeholders, (line_text, station_text, node_text)):
+                        t.text = value
+
+            # Update the date/author cells in the metadata table.
+            tables = body.findall('w:tbl', DOCX_NS)
+            for table in tables:
+                table_texts = ''.join(t.text or '' for t in table.iter('{%s}t' % NS_W))
+                if 'Engagement 10 Position Deviation' in table_texts:
+                    rows = table.findall('{%s}tr' % NS_W)
+                    # Index into each row's <w:tc> cells specifically, not the
+                    # row's raw children — a <w:trPr> sits before them and
+                    # shifts plain rows[i][1] indexing onto the label cell
+                    # instead of the value cell next to it.
+                    if len(rows) > 1:
+                        tcs = rows[1].findall('{%s}tc' % NS_W)
+                        if len(tcs) > 1:
+                            replace_cell_text(tcs[1], current_date, bold=False)
+                    if len(rows) > 3:
+                        tcs = rows[3].findall('{%s}tc' % NS_W)
+                        if len(tcs) > 1:
+                            replace_cell_text(tcs[1], author, bold=False)
+                    break
+
+            # Insert the template text after the main target table.
+            insert_after_table = None
+            for table in tables:
+                table_texts = ''.join(t.text or '' for t in table.iter('{%s}t' % NS_W))
+                if 'Engagement 10 Position Deviation' in table_texts:
+                    insert_after_table = table
+                    break
+            if insert_after_table is None:
+                self._log('⚠ "Engagement 10 Position Deviation" table not found', 'w')
+                return False
+
+            new_para = ET.Element('{%s}p' % NS_W)
+            pPr = ET.SubElement(new_para, '{%s}pPr' % NS_W)
+            ET.SubElement(pPr, '{%s}pStyle' % NS_W).set('{%s}val' % NS_W, 'Normal')
+            run = ET.SubElement(new_para, '{%s}r' % NS_W)
+            set_font_12(run, bold=False)
+            text_el = ET.SubElement(run, '{%s}t' % NS_W)
+            text_el.text = template_text
+
+            body.insert(list(body).index(insert_after_table) + 1, new_para)
+
+            updated_xml = ET.tostring(root, encoding='utf-8')
+            with zipfile.ZipFile(docx_path, 'r') as zin, zipfile.ZipFile(docx_path + '.tmp', 'w', zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == 'word/document.xml':
+                        zout.writestr(item, updated_xml)
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+
+            os.remove(docx_path)
+            os.rename(docx_path + '.tmp', docx_path)
+
+            self._log('✓ Template and metadata inserted into report', 'ok')
+            return True
+        except Exception as e:
+            self._log(f'✗ Failed to insert template: {e}', 'err')
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _insert_figure4_image(self, docx_path, image_path):
+        """Insert image as Figure 4 (Navview Map) into the document.
+        This adds the image to the DOCX, updates relationships, and embeds it in the document."""
+        try:
+            if not os.path.isfile(image_path):
+                self._log(f'✗ Image file not found: {image_path}', 'err')
+                return False
+            
+            # Read existing DOCX
+            with zipfile.ZipFile(docx_path, 'r') as z:
+                doc_xml_bytes = z.read('word/document.xml')
+                rels_xml_bytes = z.read('word/_rels/document.xml.rels')
+            
+            doc_xml_text = doc_xml_bytes.decode('utf-8')
+            root = ET.fromstring(doc_xml_bytes)
+            rels_root = ET.fromstring(rels_xml_bytes)
+            
+            body = root.find('w:body', DOCX_NS)
+            if body is None:
+                self._log('✗ Cannot find document body', 'err')
+                return False
+            
+            # Find Figure 4 caption
+            paras = list(body.iter('{%s}p' % NS_W))
+            fig4_para_idx = None
+            for i, p in enumerate(paras):
+                texts = ''.join(t.text or '' for t in p.findall('.//w:t', DOCX_NS))
+                if 'Figure 4' in texts:
+                    fig4_para_idx = i
+                    break
+            
+            if fig4_para_idx is None:
+                self._log('⚠ Figure 4 caption not found in document', 'w')
+                return False
+            
+            # Find the paragraph before Figure 4 caption (where we'll insert the image)
+            if fig4_para_idx > 0:
+                insert_para = paras[fig4_para_idx - 1]
+            else:
+                insert_para = paras[fig4_para_idx]
+            
+            # Generate new relationship ID for the image
+            existing_rels = rels_root.findall('{%s}Relationship' % 'http://schemas.openxmlformats.org/package/2006/relationships')
+            max_rel_id = 0
+            for rel in existing_rels:
+                rid = rel.get('Id')
+                if rid and rid.startswith('rId'):
+                    try:
+                        num = int(rid[3:])
+                        max_rel_id = max(max_rel_id, num)
+                    except:
+                        pass
+            
+            new_rel_id = f'rId{max_rel_id + 1}'
+            
+            # Add relationship for the image
+            NS_REL = 'http://schemas.openxmlformats.org/package/2006/relationships'
+            rel_elem = ET.Element('{%s}Relationship' % NS_REL)
+            rel_elem.set('Id', new_rel_id)
+            rel_elem.set('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image')
+            
+            # Determine image file extension
+            _, ext = os.path.splitext(image_path)
+            image_filename = f'image{max_rel_id + 1}{ext}'
+            rel_elem.set('Target', f'media/{image_filename}')
+            rels_root.append(rel_elem)
+            
+            # Create drawing element with the image
+            drawing = ET.Element('{%s}drawing' % NS_W)
+            inline = ET.SubElement(drawing, '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}inline')
+            inline.set('distT', '0')
+            inline.set('distB', '0')
+            inline.set('distL', '0')
+            inline.set('distR', '0')
+            
+            # Set extent (size) - 6 inches wide
+            extent = ET.SubElement(inline, '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}extent')
+            extent.set('cx', '5486400')  # 6 inches in EMUs
+            extent.set('cy', '4114800')  # proportional height
+            
+            # Add graphic
+            graphic = ET.SubElement(inline, '{http://schemas.openxmlformats.org/drawingml/2006/main}graphic')
+            graphicData = ET.SubElement(graphic, '{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData')
+            graphicData.set('uri', 'http://schemas.openxmlformats.org/drawingml/2006/picture')
+            
+            pic = ET.SubElement(graphicData, '{http://schemas.openxmlformats.org/drawingml/2006/picture}pic')
+            nvPicPr = ET.SubElement(pic, '{http://schemas.openxmlformats.org/drawingml/2006/picture}nvPicPr')
+            
+            cNvPr = ET.SubElement(nvPicPr, '{http://schemas.openxmlformats.org/drawingml/2006/picture}cNvPr')
+            cNvPr.set('id', '1')
+            cNvPr.set('name', 'Navview Map')
+            
+            cNvPicPr = ET.SubElement(nvPicPr, '{http://schemas.openxmlformats.org/drawingml/2006/picture}cNvPicPr')
+            blipFill = ET.SubElement(pic, '{http://schemas.openxmlformats.org/drawingml/2006/picture}blipFill')
+            blip = ET.SubElement(blipFill, '{http://schemas.openxmlformats.org/drawingml/2006/main}blip')
+            blip.set('{%s}embed' % NS_R, new_rel_id)
+            
+            stretch = ET.SubElement(blipFill, '{http://schemas.openxmlformats.org/drawingml/2006/main}stretch')
+            fillRect = ET.SubElement(stretch, '{http://schemas.openxmlformats.org/drawingml/2006/main}fillRect')
+            
+            spPr = ET.SubElement(pic, '{http://schemas.openxmlformats.org/drawingml/2006/picture}spPr')
+            xfrm = ET.SubElement(spPr, '{http://schemas.openxmlformats.org/drawingml/2006/main}xfrm')
+            off = ET.SubElement(xfrm, '{http://schemas.openxmlformats.org/drawingml/2006/main}off')
+            off.set('x', '0')
+            off.set('y', '0')
+            ext = ET.SubElement(xfrm, '{http://schemas.openxmlformats.org/drawingml/2006/main}ext')
+            ext.set('cx', '5486400')
+            ext.set('cy', '4114800')
+            
+            prstGeom = ET.SubElement(spPr, '{http://schemas.openxmlformats.org/drawingml/2006/main}prstGeom')
+            prstGeom.set('prst', 'rect')
+            avLst = ET.SubElement(prstGeom, '{http://schemas.openxmlformats.org/drawingml/2006/main}avLst')
+            
+            # Create a new run with the drawing
+            new_run = ET.Element('{%s}r' % NS_W)
+            new_run.append(drawing)
+            
+            # Insert run into a new paragraph before Figure 4 caption
+            new_para = ET.Element('{%s}p' % NS_W)
+            new_para.append(new_run)
+            
+            insert_para_index = list(body).index(insert_para)
+            body.insert(insert_para_index + 1, new_para)
+            
+            # Read image file as bytes
+            with open(image_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            # Write updated DOCX
+            updated_doc_xml = ET.tostring(root, encoding='utf-8')
+            updated_rels_xml = ET.tostring(rels_root, encoding='utf-8')
+            
+            with zipfile.ZipFile(docx_path, 'r') as zin, \
+                 zipfile.ZipFile(docx_path + '.tmp', 'w', zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == 'word/document.xml':
+                        zout.writestr(item, updated_doc_xml)
+                    elif item.filename == 'word/_rels/document.xml.rels':
+                        zout.writestr(item, updated_rels_xml)
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+                
+                # Add the image file
+                zout.writestr(f'word/media/{image_filename}', image_bytes)
+            
+            os.remove(docx_path)
+            os.rename(docx_path + '.tmp', docx_path)
+            
+            self._log(f'✓ Image inserted as Figure 4', 'ok')
+            return True
+        except Exception as e:
+            self._log(f'✗ Failed to insert image: {e}', 'err')
+            return False
+
     def _generate_report(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         template_path = os.path.join(script_dir, REPORT_TEMPLATE)
@@ -592,8 +957,181 @@ class App(tk.Tk):
         try:
             self._build_report(template_path, out_path, photo1, photo2, fix_photo)
             self._log(f'✓ Generated report: {os.path.basename(out_path)}', 'ok')
+            self.current_report_path = out_path
+            self._open_template_manager(out_path, folder_path)
         except Exception as e:
             self._log(f'✗ Report generation failed: {e}', 'err')
+
+    def _open_template_manager(self, report_path, folder_path):
+        """Open template manager window for adding templates to the report."""
+        win = tk.Toplevel(self)
+        win.title('Template Manager')
+        win.configure(bg=BG)
+        win.geometry('600x600')
+        win.transient(self)
+
+        # Extract FM number from folder path
+        fm_number = self._extract_fm_number(folder_path)
+
+        # ── Title ──
+        tk.Label(win, text='Engagement 10 Templates & Metadata', font=FB, bg=BG, fg=GREEN).pack(padx=12, pady=(12, 6), anchor='w')
+
+        # ── Templates Listbox ──
+        tk.Label(win, text='Saved Templates:', font=FM, bg=BG, fg=FG_DIM).pack(padx=12, pady=(6, 2), anchor='w')
+        
+        list_frame = tk.Frame(win, bg=BG)
+        list_frame.pack(fill='both', expand=True, padx=12, pady=(0, 6))
+
+        scrollbar = tk.Scrollbar(list_frame, bg=BORDER, troughcolor=BG, relief='flat')
+        scrollbar.pack(side='right', fill='y')
+
+        templates_list = tk.Listbox(list_frame, font=FM, bg=PANEL, fg=FG, yscrollcommand=scrollbar.set,
+                                     relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
+        templates_list.pack(side='left', fill='both', expand=True)
+        scrollbar.config(command=templates_list.yview)
+
+        # Load existing templates
+        templates = self._load_templates()
+        for i, tmpl in enumerate(templates):
+            templates_list.insert(i, tmpl)
+
+        # ── New Template Entry ──
+        entry_frame = tk.Frame(win, bg=BG)
+        entry_frame.pack(fill='x', padx=12, pady=6)
+
+        tk.Label(entry_frame, text='New Template:', font=FM, bg=BG, fg=FG_DIM).pack(anchor='w')
+
+        new_template_var = tk.StringVar()
+        new_template_entry = tk.Entry(entry_frame, textvariable=new_template_var, font=FM, bg=PANEL, fg=FG,
+                                       insertbackground=FG, relief='flat', bd=0,
+                                       highlightthickness=1, highlightbackground=BORDER)
+        new_template_entry.pack(fill='x', pady=(3, 0))
+
+        # ── Metadata Fields ──
+        meta_frame = tk.LabelFrame(win, text='Document Metadata', font=FM, bg=BG, fg=FG_DIM, relief='flat', bd=0)
+        meta_frame.pack(fill='x', padx=12, pady=6)
+
+        # Line number
+        line_frame = tk.Frame(meta_frame, bg=BG)
+        line_frame.pack(fill='x', pady=3)
+        tk.Label(line_frame, text='Line #:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
+        line_var = tk.StringVar(value='00001')
+        line_entry = tk.Entry(line_frame, textvariable=line_var, font=FM, bg=PANEL, fg=FG, width=10,
+                              insertbackground=FG, relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
+        line_entry.pack(side='left', padx=(0, 6))
+
+        # Station number
+        tk.Label(line_frame, text='Station #:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
+        station_var = tk.StringVar(value='00001')
+        station_entry = tk.Entry(line_frame, textvariable=station_var, font=FM, bg=PANEL, fg=FG, width=10,
+                                 insertbackground=FG, relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
+        station_entry.pack(side='left', padx=(0, 6))
+
+        # Node number
+        tk.Label(line_frame, text='Node #:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
+        node_var = tk.StringVar(value='00001')
+        node_entry = tk.Entry(line_frame, textvariable=node_var, font=FM, bg=PANEL, fg=FG, width=10,
+                              insertbackground=FG, relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
+        node_entry.pack(side='left')
+
+        # Author name
+        author_frame = tk.Frame(meta_frame, bg=BG)
+        author_frame.pack(fill='x', pady=3)
+        tk.Label(author_frame, text='Author:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
+        author_var = tk.StringVar()
+        author_entry = tk.Entry(author_frame, textvariable=author_var, font=FM, bg=PANEL, fg=FG,
+                                insertbackground=FG, relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
+        author_entry.pack(side='left', fill='x', expand=True)
+
+        # FM number display
+        fm_frame = tk.Frame(meta_frame, bg=BG)
+        fm_frame.pack(fill='x', pady=3)
+        tk.Label(fm_frame, text='FM #:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
+        tk.Label(fm_frame, text=fm_number, font=FM, bg=PANEL, fg=GREEN, width=10, anchor='w',
+                 relief='flat', bd=0).pack(side='left')
+        tk.Label(fm_frame, text='(Auto-detected)', font=FM, bg=BG, fg=FG_DIM).pack(side='left', padx=(6, 0))
+
+        # ── Buttons ──
+        btn_frame = tk.Frame(win, bg=BG)
+        btn_frame.pack(fill='x', padx=12, pady=(0, 12))
+
+        image_selected = {'path': None}  # Track selected image
+
+        def browse_image():
+            """Browse and select image to insert as Figure 4."""
+            img_path = filedialog.askopenfilename(
+                initialdir=folder_path,
+                title='Select Image for Figure 4 (Navview Map)',
+                filetypes=[('Image Files', '*.png *.jpg *.jpeg *.bmp'), ('All Files', '*.*')]
+            )
+            if img_path:
+                image_selected['path'] = img_path
+                if self._insert_figure4_image(report_path, img_path):
+                    self._log(f'✓ Figure 4 image selected and inserted', 'ok')
+                    # Update button text to show image is selected
+                    browse_btn.config(text=f'✓ Image: {os.path.basename(img_path)[:20]}', fg=GREEN)
+
+        def add_template():
+            text = new_template_var.get().strip()
+            if text:
+                templates.append(text)
+                self._save_templates(templates)
+                templates_list.insert(tk.END, text)
+                new_template_var.set('')
+                self._log(f'✓ Template added', 'ok')
+
+        def delete_template():
+            sel = templates_list.curselection()
+            if sel:
+                idx = sel[0]
+                templates_list.delete(idx)
+                templates.pop(idx)
+                self._save_templates(templates)
+                self._log(f'✓ Template deleted', 'ok')
+
+        def insert_template():
+            sel = templates_list.curselection()
+            if not sel:
+                self._log('✗ Please select a template to insert', 'err')
+                return
+            
+            # Validate inputs
+            line = line_var.get().strip()
+            station = station_var.get().strip()
+            node = node_var.get().strip()
+            author = author_var.get().strip()
+            
+            if not author:
+                self._log('✗ Please enter Author name', 'err')
+                return
+            
+            # Validate 5-digit numbers
+            try:
+                int(line)
+                int(station)
+                int(node)
+            except ValueError:
+                self._log('✗ Line, Station, and Node must be numeric', 'err')
+                return
+            
+            idx = sel[0]
+            template_text = templates[idx]
+            if self._insert_template_into_docx(report_path, template_text, fm_number, line, station, node, author):
+                self._log(f'✓ Template and metadata inserted', 'ok')
+                win.destroy()
+
+        tk.Button(btn_frame, text='Add Template', font=FM, bg=GREEN, fg='#000', relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=add_template).pack(side='left', padx=(0, 3))
+
+        tk.Button(btn_frame, text='Delete', font=FM, bg=RED, fg='#fff', relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=delete_template).pack(side='left', padx=3)
+
+        browse_btn = tk.Button(btn_frame, text='Browse & Insert Image', font=FM, bg=BORDER, fg=YELLOW, relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=browse_image)
+        browse_btn.pack(side='left', padx=3)
+
+        tk.Button(btn_frame, text='Insert & Close', font=FM, bg=GREEN, fg='#000', relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=insert_template).pack(side='right')
 
 
 if __name__ == '__main__':
