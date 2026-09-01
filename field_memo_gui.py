@@ -782,7 +782,11 @@ class App(tk.Tk):
                 ET.SubElement(pPr, '{%s}pStyle' % NS_W).set('{%s}val' % NS_W, 'Normal')
                 if line_text:
                     run = ET.SubElement(p, '{%s}r' % NS_W)
-                    set_font_12(run, bold=False)
+                    # No explicit rPr here — the run inherits the "Normal"
+                    # style's rPr (sz=22, i.e. 11pt) and the theme's minor
+                    # font (Arial), which is exactly what Word's font box
+                    # shows as "Arial (Body) 11". set_font_12 would instead
+                    # force literal Arial 12pt, overriding both.
                     text_el = ET.SubElement(run, '{%s}t' % NS_W)
                     if line_text[0].isspace() or line_text[-1].isspace() or '  ' in line_text:
                         text_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
