@@ -704,6 +704,17 @@ class App(tk.Tk):
                                 f'IFR-PXGEO-OBN-013626-FM-{fm_number}',
                             )
                             break
+                elif 'IFR-PXGEO-OBN-013626-' in txt:
+                    # The "Document Number:" table row carries the same bare
+                    # prefix as the title line, just without "REVISION" next
+                    # to it — needs the same FM suffix appended.
+                    for t in t_elems:
+                        if t.text and 'IFR-PXGEO-OBN-013626-' in t.text:
+                            t.text = t.text.replace(
+                                'IFR-PXGEO-OBN-013626-',
+                                f'IFR-PXGEO-OBN-013626-FM-{fm_number}',
+                            )
+                            break
                 elif txt.strip() == 'Day/Month/Year' or ('Day' in txt and 'Month' in txt and 'Year' in txt):
                     for t in t_elems:
                         if t.text == 'Day':
@@ -856,7 +867,21 @@ class App(tk.Tk):
             extent = ET.SubElement(inline, '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}extent')
             extent.set('cx', '5486400')  # 6 inches in EMUs
             extent.set('cy', '4114800')  # proportional height
-            
+
+            # wp:docPr is a REQUIRED child of wp:inline (right after extent,
+            # before graphic) per the OOXML schema. Omitting it is exactly
+            # what makes Word flag the file as unreadable content needing
+            # recovery — it's not optional the way cNvGraphicFramePr is.
+            existing_docpr_ids = [
+                int(dp.get('id')) for dp in root.iter(
+                    '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr')
+                if dp.get('id') and dp.get('id').isdigit()
+            ]
+            new_docpr_id = max(existing_docpr_ids, default=0) + 1
+            docPr = ET.SubElement(inline, '{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr')
+            docPr.set('id', str(new_docpr_id))
+            docPr.set('name', f'Picture {new_docpr_id}')
+
             # Add graphic
             graphic = ET.SubElement(inline, '{http://schemas.openxmlformats.org/drawingml/2006/main}graphic')
             graphicData = ET.SubElement(graphic, '{http://schemas.openxmlformats.org/drawingml/2006/main}graphicData')
@@ -866,7 +891,7 @@ class App(tk.Tk):
             nvPicPr = ET.SubElement(pic, '{http://schemas.openxmlformats.org/drawingml/2006/picture}nvPicPr')
             
             cNvPr = ET.SubElement(nvPicPr, '{http://schemas.openxmlformats.org/drawingml/2006/picture}cNvPr')
-            cNvPr.set('id', '1')
+            cNvPr.set('id', str(new_docpr_id))
             cNvPr.set('name', 'Navview Map')
             
             cNvPicPr = ET.SubElement(nvPicPr, '{http://schemas.openxmlformats.org/drawingml/2006/picture}cNvPicPr')
