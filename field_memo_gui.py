@@ -6,7 +6,7 @@ import shutil
 import zipfile
 import xml.etree.ElementTree as ET
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, simpledialog
 from datetime import datetime
 
 # ─────────────────────────────────────────────
@@ -759,23 +759,28 @@ class App(tk.Tk):
                 self._log('⚠ "Engagement 10 Position Deviation" table not found', 'w')
                 return False
 
-            new_para = ET.Element('{%s}p' % NS_W)
-            pPr = ET.SubElement(new_para, '{%s}pPr' % NS_W)
-            ET.SubElement(pPr, '{%s}pStyle' % NS_W).set('{%s}val' % NS_W, 'Normal')
-            run = ET.SubElement(new_para, '{%s}r' % NS_W)
-            set_font_12(run, bold=False)
-            text_el = ET.SubElement(run, '{%s}t' % NS_W)
-            text_el.text = template_text
+            def make_normal_paragraph(line_text=''):
+                p = ET.Element('{%s}p' % NS_W)
+                pPr = ET.SubElement(p, '{%s}pPr' % NS_W)
+                ET.SubElement(pPr, '{%s}pStyle' % NS_W).set('{%s}val' % NS_W, 'Normal')
+                if line_text:
+                    run = ET.SubElement(p, '{%s}r' % NS_W)
+                    set_font_12(run, bold=False)
+                    text_el = ET.SubElement(run, '{%s}t' % NS_W)
+                    if line_text[0].isspace() or line_text[-1].isspace() or '  ' in line_text:
+                        text_el.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    text_el.text = line_text
+                return p
 
             # A blank spacer paragraph between the table and the template
             # text, so it doesn't sit flush against the table border.
-            spacer_para = ET.Element('{%s}p' % NS_W)
-            spacer_pPr = ET.SubElement(spacer_para, '{%s}pPr' % NS_W)
-            ET.SubElement(spacer_pPr, '{%s}pStyle' % NS_W).set('{%s}val' % NS_W, 'Normal')
-
+            # Each Enter the user typed in the editor becomes its own <w:p>,
+            # so paragraph breaks in the editor carry through the same way
+            # into the generated report.
             insert_idx = list(body).index(insert_after_table) + 1
-            body.insert(insert_idx, spacer_para)
-            body.insert(insert_idx + 1, new_para)
+            body.insert(insert_idx, make_normal_paragraph())
+            for offset, line_text in enumerate(template_text.split('\n'), start=1):
+                body.insert(insert_idx + offset, make_normal_paragraph(line_text))
 
             updated_xml = ET.tostring(root, encoding='utf-8')
             with zipfile.ZipFile(docx_path, 'r') as zin, zipfile.ZipFile(docx_path + '.tmp', 'w', zipfile.ZIP_DEFLATED) as zout:
@@ -1000,7 +1005,8 @@ class App(tk.Tk):
         win = tk.Toplevel(self)
         win.title('Template Manager')
         win.configure(bg=BG)
-        win.geometry('600x600')
+        win.geometry('640x680')
+        win.minsize(480, 500)
         win.transient(self)
 
         # Extract FM number from folder path
@@ -1009,36 +1015,111 @@ class App(tk.Tk):
         # ── Title ──
         tk.Label(win, text='Engagement 10 Templates & Metadata', font=FB, bg=BG, fg=GREEN).pack(padx=12, pady=(12, 6), anchor='w')
 
-        # ── Templates Listbox ──
-        tk.Label(win, text='Saved Templates:', font=FM, bg=BG, fg=FG_DIM).pack(padx=12, pady=(6, 2), anchor='w')
-        
-        list_frame = tk.Frame(win, bg=BG)
-        list_frame.pack(fill='both', expand=True, padx=12, pady=(0, 6))
-
-        scrollbar = tk.Scrollbar(list_frame, bg=BORDER, troughcolor=BG, relief='flat')
-        scrollbar.pack(side='right', fill='y')
-
-        templates_list = tk.Listbox(list_frame, font=FM, bg=PANEL, fg=FG, yscrollcommand=scrollbar.set,
-                                     relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
-        templates_list.pack(side='left', fill='both', expand=True)
-        scrollbar.config(command=templates_list.yview)
-
-        # Load existing templates
+        # ── Templates — one button per saved template ──
+        # templates: list of {'name': short label shown on the button, 'text': saved body}.
+        # selected['index'] tracks which template is currently loaded into the
+        # editor below, so Update/Delete know which one to act on.
         templates = self._load_templates()
-        for i, tmpl in enumerate(templates):
-            templates_list.insert(i, tmpl)
+        selected = {'index': None}
+        template_buttons = []
+        TEMPLATES_PER_ROW = 4
 
-        # ── New Template Entry ──
-        entry_frame = tk.Frame(win, bg=BG)
-        entry_frame.pack(fill='x', padx=12, pady=6)
+        tk.Label(win, text='Templates — click to load, edit freely below, then Insert:',
+                 font=FM, bg=BG, fg=FG_DIM).pack(padx=12, pady=(6, 2), anchor='w')
 
-        tk.Label(entry_frame, text='New Template:', font=FM, bg=BG, fg=FG_DIM).pack(anchor='w')
+        buttons_wrap = tk.Frame(win, bg=BG)
+        buttons_wrap.pack(fill='x', padx=12, pady=(0, 4))
 
-        new_template_var = tk.StringVar()
-        new_template_entry = tk.Entry(entry_frame, textvariable=new_template_var, font=FM, bg=PANEL, fg=FG,
-                                       insertbackground=FG, relief='flat', bd=0,
-                                       highlightthickness=1, highlightbackground=BORDER)
-        new_template_entry.pack(fill='x', pady=(3, 0))
+        def highlight_selected():
+            for i, b in enumerate(template_buttons):
+                if i == selected['index']:
+                    b.configure(bg=GREEN, fg='#000')
+                else:
+                    b.configure(bg=PANEL, fg=FG)
+
+        def load_template(i):
+            selected['index'] = i
+            editor.delete('1.0', 'end')
+            editor.insert('1.0', templates[i]['text'])
+            highlight_selected()
+
+        def rebuild_template_buttons():
+            for child in buttons_wrap.winfo_children():
+                child.destroy()
+            template_buttons.clear()
+            row = None
+            for i, tmpl in enumerate(templates):
+                if i % TEMPLATES_PER_ROW == 0:
+                    row = tk.Frame(buttons_wrap, bg=BG)
+                    row.pack(fill='x', pady=2)
+                b = tk.Button(row, text=tmpl['name'], font=FM, relief='flat', bd=0,
+                              cursor='hand2', padx=10, pady=4, bg=PANEL, fg=FG,
+                              command=lambda i=i: load_template(i))
+                b.pack(side='left', padx=(0, 4))
+                template_buttons.append(b)
+            highlight_selected()
+
+        def add_template():
+            name = simpledialog.askstring(
+                'New Template', 'Short name (e.g. "Slope", "Benthic"):', parent=win)
+            if not name or not name.strip():
+                return
+            templates.append({'name': name.strip(), 'text': ''})
+            self._save_templates(templates)
+            rebuild_template_buttons()
+            load_template(len(templates) - 1)
+            editor.focus_set()
+            self._log(f'✓ Template "{name.strip()}" added', 'ok')
+
+        def update_template():
+            if selected['index'] is None:
+                self._log('✗ Select a template first', 'err')
+                return
+            templates[selected['index']]['text'] = editor.get('1.0', 'end-1c')
+            self._save_templates(templates)
+            self._log(f'✓ Template "{templates[selected["index"]]["name"]}" updated', 'ok')
+
+        def delete_template():
+            if selected['index'] is None:
+                self._log('✗ Select a template first', 'err')
+                return
+            name = templates[selected['index']]['name']
+            templates.pop(selected['index'])
+            self._save_templates(templates)
+            selected['index'] = None
+            editor.delete('1.0', 'end')
+            rebuild_template_buttons()
+            self._log(f'✓ Template "{name}" deleted', 'ok')
+
+        tk.Button(win, text='+ Add Template', font=FM, bg=GREEN, fg='#000', relief='flat',
+                  bd=0, cursor='hand2', padx=10, pady=3,
+                  command=add_template).pack(padx=12, pady=(0, 6), anchor='w')
+
+        # ── Editable template text — a real multi-line Text widget, so
+        # Enter starts a new paragraph here exactly like it will in Word,
+        # instead of the single-line Entry that could only hold one line. ──
+        tk.Label(win, text='Template Text (Enter = new paragraph in the report):',
+                 font=FM, bg=BG, fg=FG_DIM).pack(padx=12, pady=(6, 2), anchor='w')
+
+        editor_frame = tk.Frame(win, bg=BG)
+        editor_frame.pack(fill='both', expand=True, padx=12, pady=(0, 6))
+        editor_scroll = tk.Scrollbar(editor_frame, bg=BORDER, troughcolor=BG, relief='flat')
+        editor_scroll.pack(side='right', fill='y')
+        editor = tk.Text(editor_frame, font=FM, bg=PANEL, fg=FG, insertbackground=FG,
+                          relief='flat', bd=0, highlightthickness=1, highlightcolor=GREEN,
+                          highlightbackground=BORDER, wrap='word', height=8,
+                          yscrollcommand=editor_scroll.set)
+        editor.pack(side='left', fill='both', expand=True)
+        editor_scroll.config(command=editor.yview)
+
+        edit_btn_row = tk.Frame(win, bg=BG)
+        edit_btn_row.pack(fill='x', padx=12, pady=(0, 6))
+        tk.Button(edit_btn_row, text='Update Template', font=FM, bg=BORDER, fg=YELLOW, relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=update_template).pack(side='left', padx=(0, 3))
+        tk.Button(edit_btn_row, text='Delete Template', font=FM, bg=RED, fg='#fff', relief='flat',
+                  bd=0, cursor='hand2', padx=10, command=delete_template).pack(side='left', padx=3)
+
+        rebuild_template_buttons()
 
         # ── Metadata Fields ──
         meta_frame = tk.LabelFrame(win, text='Document Metadata', font=FM, bg=BG, fg=FG_DIM, relief='flat', bd=0)
@@ -1104,41 +1185,22 @@ class App(tk.Tk):
                     # Update button text to show image is selected
                     browse_btn.config(text=f'✓ Image: {os.path.basename(img_path)[:20]}', fg=GREEN)
 
-        def add_template():
-            text = new_template_var.get().strip()
-            if text:
-                templates.append(text)
-                self._save_templates(templates)
-                templates_list.insert(tk.END, text)
-                new_template_var.set('')
-                self._log(f'✓ Template added', 'ok')
-
-        def delete_template():
-            sel = templates_list.curselection()
-            if sel:
-                idx = sel[0]
-                templates_list.delete(idx)
-                templates.pop(idx)
-                self._save_templates(templates)
-                self._log(f'✓ Template deleted', 'ok')
-
         def insert_template():
-            sel = templates_list.curselection()
-            if not sel:
-                self._log('✗ Please select a template to insert', 'err')
+            text = editor.get('1.0', 'end-1c')
+            if not text.strip():
+                self._log('✗ No template text to insert — load or type one first', 'err')
                 return
-            
+
             # Validate inputs
             line = line_var.get().strip()
             station = station_var.get().strip()
             node = node_var.get().strip()
             author = author_var.get().strip()
-            
+
             if not author:
                 self._log('✗ Please enter Author name', 'err')
                 return
-            
-            # Validate 5-digit numbers
+
             try:
                 int(line)
                 int(station)
@@ -1146,18 +1208,10 @@ class App(tk.Tk):
             except ValueError:
                 self._log('✗ Line, Station, and Node must be numeric', 'err')
                 return
-            
-            idx = sel[0]
-            template_text = templates[idx]
-            if self._insert_template_into_docx(report_path, template_text, fm_number, line, station, node, author):
+
+            if self._insert_template_into_docx(report_path, text, fm_number, line, station, node, author):
                 self._log(f'✓ Template and metadata inserted', 'ok')
                 win.destroy()
-
-        tk.Button(btn_frame, text='Add Template', font=FM, bg=GREEN, fg='#000', relief='flat',
-                  bd=0, cursor='hand2', padx=10, command=add_template).pack(side='left', padx=(0, 3))
-
-        tk.Button(btn_frame, text='Delete', font=FM, bg=RED, fg='#fff', relief='flat',
-                  bd=0, cursor='hand2', padx=10, command=delete_template).pack(side='left', padx=3)
 
         browse_btn = tk.Button(btn_frame, text='Browse & Insert Image', font=FM, bg=BORDER, fg=YELLOW, relief='flat',
                   bd=0, cursor='hand2', padx=10, command=browse_image)
