@@ -98,6 +98,7 @@ class App(tk.Tk):
         self.udp_stop_events = {'333': threading.Event(), '334': threading.Event()}
         self.last_fix = {'333': None, '334': None}  # most recently received {easting, northing, line, station, node}
         self._last_fix_lock = threading.Lock()
+        self._udp_restart_job = {'333': None, '334': None}  # debounce timer per UHD, see _on_udp_port_changed
         for which, cfg_key in (('333', 'uhd333_udp_port'), ('334', 'uhd334_udp_port')):
             v = tk.StringVar(value=cfg.get(cfg_key, ''))
             self.udp_port_vars[which] = v
@@ -355,6 +356,17 @@ class App(tk.Tk):
     # ══════════════════════════════════════════
     def _on_udp_port_changed(self, which):
         self._save_config()
+        # Debounced — the StringVar fires this on every keystroke, so typing
+        # "8808" would otherwise try to bind "8", "88", "880" along the way.
+        # Those are all under 1024 (Windows' privileged-port range), so a
+        # non-admin bind legitimately fails with WinError 10013 on each one.
+        # Wait until typing pauses before actually rebinding.
+        if self._udp_restart_job[which] is not None:
+            self.after_cancel(self._udp_restart_job[which])
+        self._udp_restart_job[which] = self.after(600, lambda: self._do_restart_udp_listener(which))
+
+    def _do_restart_udp_listener(self, which):
+        self._udp_restart_job[which] = None
         self._restart_udp_listener(which)
 
     def _restart_udp_listener(self, which):
