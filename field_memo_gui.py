@@ -428,7 +428,9 @@ class App(tk.Tk):
 
             fix = self._parse_udp_fix(data)
             if fix is None:
-                self.after(0, lambda: self._log(f'⚠ UHD{which}: unrecognized UDP fix string', 'w'))
+                raw_preview = data.decode('utf-8', errors='replace').strip()[:200]
+                self.after(0, lambda rp=raw_preview: self._log(
+                    f'⚠ UHD{which}: unrecognized UDP fix string: {rp!r}', 'w'))
                 continue
 
             with self._last_fix_lock:
