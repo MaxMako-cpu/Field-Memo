@@ -445,19 +445,26 @@ class App(tk.Tk):
             pass
 
     def _parse_udp_fix(self, raw):
-        """Parse 'timestamp,easting,northing,line.000,station.000,node' —
-        the timestamp is ignored; line/station/node are truncated to
-        integers (dropping the trailing .000, when present)."""
+        """Parse '<whatever>,easting,northing,line.000,station.000,node' —
+        the leading timestamp is ignored by taking the LAST 5 comma-
+        separated fields rather than assuming a fixed position for them.
+        Some locales write the timestamp's fractional seconds with a comma
+        instead of a period (e.g. "23:13:43,767Z"), which would otherwise
+        split into an extra field and throw off a fixed-index parse; taking
+        from the end instead sidesteps that regardless of how many pieces
+        the timestamp itself splits into. line/station/node are truncated
+        to integers (dropping the trailing .000, when present)."""
         try:
             parts = [p.strip() for p in raw.decode('utf-8', errors='ignore').strip().split(',')]
-            if len(parts) < 6:
+            if len(parts) < 5:
                 return None
+            easting, northing, line, station, node = parts[-5:]
             return {
-                'easting':  float(parts[1]),
-                'northing': float(parts[2]),
-                'line':     int(float(parts[3])),
-                'station':  int(float(parts[4])),
-                'node':     int(float(parts[5])),
+                'easting':  float(easting),
+                'northing': float(northing),
+                'line':     int(float(line)),
+                'station':  int(float(station)),
+                'node':     int(float(node)),
             }
         except Exception:
             return None
