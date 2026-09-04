@@ -3,6 +3,8 @@ import re
 import glob
 import json
 import shutil
+import socket
+import threading
 import zipfile
 import xml.etree.ElementTree as ET
 import tkinter as tk
@@ -32,6 +34,13 @@ CONFIG_FILENAME = 'field_memo_config.json'
 
 # Templates for text insertion under the Engagement 10 Position Deviation table
 TEMPLATES_FILENAME = 'field_memo_templates.json'
+
+# NavView broadcasts a UDP line per UHD when a fix is taken:
+#   <ISO8601 timestamp>,<easting>,<northing>,<line>.000,<station>.000,<node>
+# Captured at Complete Event time and saved next to that event's photos, so
+# Generate Report can fill the Landed Node position / Line-Station-Node even
+# if the app restarts in between.
+UDP_FIX_FILENAME = 'udp_fix.json'
 
 # OOXML namespaces used when editing the report's word/document.xml
 NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
@@ -74,6 +83,17 @@ class App(tk.Tk):
                     self.uhd334_image_var, self.dest_folder_var):
             var.trace_add('write', lambda *args: self._save_config())
 
+        # ── UDP fix listeners — one per UHD, port configurable in Settings ──
+        self.udp_port_vars = {}
+        self.udp_sockets = {'333': None, '334': None}
+        self.udp_stop_events = {'333': threading.Event(), '334': threading.Event()}
+        self.last_fix = {'333': None, '334': None}  # most recently received {easting, northing, line, station, node}
+        self._last_fix_lock = threading.Lock()
+        for which, cfg_key in (('333', 'uhd333_udp_port'), ('334', 'uhd334_udp_port')):
+            v = tk.StringVar(value=cfg.get(cfg_key, ''))
+            self.udp_port_vars[which] = v
+            v.trace_add('write', lambda *a, w=which: self._on_udp_port_changed(w))
+
         # ── event state machine ──
         # active_uhd: None | "333" | "334" — which button (if any) is armed,
         # waiting for its second click. Only one event can be in progress at
@@ -86,6 +106,9 @@ class App(tk.Tk):
         self.current_report_path = None  # Stores path to generated report for template insertion
 
         self._build_ui()
+
+        for which in ('333', '334'):
+            self._restart_udp_listener(which)
 
     # ══════════════════════════════════════════
     #  UI
@@ -111,7 +134,7 @@ class App(tk.Tk):
 
         self._paths_open = False
         self.paths_toggle = tk.Button(
-            paths_wrap, text='▶ PATHS', font=FM, bg=PANEL, fg=FG_DIM,
+            paths_wrap, text='▶ SETTINGS', font=FM, bg=PANEL, fg=FG_DIM,
             relief='flat', bd=0, anchor='w', cursor='hand2',
             activebackground=BORDER, highlightthickness=1,
             highlightbackground=BORDER, padx=8, pady=3,
@@ -140,6 +163,23 @@ class App(tk.Tk):
                       bd=0, cursor='hand2', padx=6,
                       command=lambda v=var, d=is_dir: self._browse(v, d)
                       ).grid(row=i, column=2, padx=(4, 2), pady=3)
+
+        # UDP fix ports — no browse button, just a port number per UHD.
+        port_entries = [
+            ('UHD333 Port', self.udp_port_vars['333']),
+            ('UHD334 Port', self.udp_port_vars['334']),
+        ]
+        port_row_start = len(entries)
+        for i, (lbl, var) in enumerate(port_entries):
+            row = port_row_start + i
+            tk.Label(self.paths_body, text=lbl, font=FM, bg=BG, fg=FG_DIM,
+                      anchor='w', width=7
+                      ).grid(row=row, column=0, sticky='w', padx=(2, 2), pady=3)
+            tk.Entry(self.paths_body, textvariable=var, font=FM, bg=PANEL, fg=FG,
+                      insertbackground=FG, relief='flat', bd=0,
+                      highlightthickness=1, highlightcolor=GREEN,
+                      highlightbackground=BORDER
+                      ).grid(row=row, column=1, sticky='ew', pady=3)
 
         # ── log ──
         lf = tk.Frame(self, bg=BG)
@@ -196,10 +236,10 @@ class App(tk.Tk):
     def _toggle_paths(self):
         self._paths_open = not self._paths_open
         if self._paths_open:
-            self.paths_toggle.configure(text='▼ PATHS')
+            self.paths_toggle.configure(text='▼ SETTINGS')
             self.paths_body.grid(row=1, column=0, sticky='ew', pady=(4, 0))
         else:
-            self.paths_toggle.configure(text='▶ PATHS')
+            self.paths_toggle.configure(text='▶ SETTINGS')
             self.paths_body.grid_forget()
 
     # ══════════════════════════════════════════
@@ -292,12 +332,116 @@ class App(tk.Tk):
             'uhd333_image': self.uhd333_image_var.get(),
             'uhd334_image': self.uhd334_image_var.get(),
             'dest_folder':  self.dest_folder_var.get(),
+            'uhd333_udp_port': self.udp_port_vars['333'].get(),
+            'uhd334_udp_port': self.udp_port_vars['334'].get(),
         }
         try:
             with open(self._config_path(), 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
         except Exception:
             pass  # best-effort — a failed save shouldn't interrupt the tool
+
+    # ══════════════════════════════════════════
+    #  UDP FIX LISTENER — one per UHD, port set in Settings
+    # ══════════════════════════════════════════
+    def _on_udp_port_changed(self, which):
+        self._save_config()
+        self._restart_udp_listener(which)
+
+    def _restart_udp_listener(self, which):
+        """(Re)start the UDP listener thread for one UHD, closing any
+        previous socket/thread for it first. Called on startup and whenever
+        that UHD's port field changes."""
+        self.udp_stop_events[which].set()
+        old_sock = self.udp_sockets.get(which)
+        if old_sock is not None:
+            try:
+                old_sock.close()
+            except Exception:
+                pass
+        self.udp_sockets[which] = None
+        self.udp_stop_events[which] = threading.Event()
+
+        port_str = self.udp_port_vars[which].get().strip()
+        if not port_str:
+            return  # no port configured — listener stays off
+        try:
+            port = int(port_str)
+        except ValueError:
+            self._log(f'✗ Invalid UHD{which} UDP port: "{port_str}"', 'err')
+            return
+
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('0.0.0.0', port))
+            sock.settimeout(1.0)  # periodic wake-up so the stop event is checked
+        except Exception as e:
+            self._log(f'✗ Could not open UHD{which} UDP port {port}: {e}', 'err')
+            return
+
+        self.udp_sockets[which] = sock
+        stop_event = self.udp_stop_events[which]
+        threading.Thread(target=self._udp_listen_loop, args=(which, sock, stop_event), daemon=True).start()
+        self._log(f'✓ Listening for UHD{which} fixes on UDP port {port}', 'ok')
+
+    def _udp_listen_loop(self, which, sock, stop_event):
+        """Runs on a background thread. GUI/log updates are marshaled back
+        onto the main thread via self.after — Tkinter widgets aren't
+        thread-safe to touch directly from here."""
+        while not stop_event.is_set():
+            try:
+                data, _addr = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break  # socket closed — listener is being restarted/torn down
+
+            fix = self._parse_udp_fix(data)
+            if fix is None:
+                self.after(0, lambda: self._log(f'⚠ UHD{which}: unrecognized UDP fix string', 'w'))
+                continue
+
+            with self._last_fix_lock:
+                self.last_fix[which] = fix
+            self.after(0, lambda f=fix: self._log(
+                f'📡 UHD{which} fix: E={f["easting"]:.3f} N={f["northing"]:.3f} '
+                f'Line={f["line"]} Station={f["station"]} Node={f["node"]}', 'ok'))
+
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    def _parse_udp_fix(self, raw):
+        """Parse 'timestamp,easting,northing,line.000,station.000,node' —
+        the timestamp is ignored; line/station/node are truncated to
+        integers (dropping the trailing .000, when present)."""
+        try:
+            parts = [p.strip() for p in raw.decode('utf-8', errors='ignore').strip().split(',')]
+            if len(parts) < 6:
+                return None
+            return {
+                'easting':  float(parts[1]),
+                'northing': float(parts[2]),
+                'line':     int(float(parts[3])),
+                'station':  int(float(parts[4])),
+                'node':     int(float(parts[5])),
+            }
+        except Exception:
+            return None
+
+    def _load_udp_fix(self, folder_path):
+        """Read the UDP fix captured for this event folder (if any) — see
+        UDP_FIX_FILENAME. Returns None if no fix was received/saved."""
+        path = os.path.join(folder_path, UDP_FIX_FILENAME)
+        if os.path.isfile(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                return None
+        return None
 
     # ══════════════════════════════════════════
     #  BROWSE
@@ -409,6 +553,21 @@ class App(tk.Tk):
             self._log(f'✗ No photos found for Fix Image ({self.fix_image_var.get()})', 'err')
             self._log('⚠ No Fix Image found — UHD photo kept its own filename', 'w')
             self._copy_latest(self._uhd_pattern(which), folder_path, f'UHD{which} #2')
+
+        with self._last_fix_lock:
+            fix = self.last_fix.get(which)
+        if fix is not None:
+            try:
+                with open(os.path.join(folder_path, UDP_FIX_FILENAME), 'w', encoding='utf-8') as f:
+                    json.dump(fix, f, indent=2)
+                self._log(
+                    f'✓ Captured UDP fix: E={fix["easting"]:.3f} N={fix["northing"]:.3f} '
+                    f'Line={fix["line"]} Station={fix["station"]} Node={fix["node"]}', 'ok')
+            except Exception as e:
+                self._log(f'✗ Could not save UDP fix: {e}', 'err')
+        else:
+            self._log(f'⚠ No UDP fix received yet for UHD{which} — Line/Station/Node and '
+                       f'Landed position will need to be entered manually', 'w')
 
         if self.reason_win is not None:
             try:
@@ -993,6 +1152,83 @@ class App(tk.Tk):
             self._log(f'✗ Failed to insert image: {e}', 'err')
             return False
 
+    def _insert_landed_node_position(self, docx_path, easting, northing):
+        """Fill the 'Landed Node' row's Easting/Northing cells in the
+        'Node Position Deviation' table (a separate table from the metadata
+        one _insert_template_into_docx edits) with the position captured
+        from the UHD's UDP fix."""
+        try:
+            with zipfile.ZipFile(docx_path, 'r') as z:
+                doc_xml_bytes = z.read('word/document.xml')
+            root = ET.fromstring(doc_xml_bytes)
+            body = root.find('w:body', DOCX_NS)
+            if body is None:
+                return False
+
+            target_table = None
+            for table in body.findall('{%s}tbl' % NS_W):
+                rows = table.findall('{%s}tr' % NS_W)
+                if not rows:
+                    continue
+                first_row_text = ''.join(t.text or '' for t in rows[0].iter('{%s}t' % NS_W))
+                if 'Node Position Deviation' in first_row_text:
+                    target_table = table
+                    break
+            if target_table is None:
+                self._log('⚠ "Node Position Deviation" table not found', 'w')
+                return False
+
+            landed_row = None
+            for row in target_table.findall('{%s}tr' % NS_W):
+                tcs = row.findall('{%s}tc' % NS_W)
+                if tcs:
+                    label = ''.join(t.text or '' for t in tcs[0].iter('{%s}t' % NS_W))
+                    if 'Landed' in label:
+                        landed_row = row
+                        break
+            if landed_row is None:
+                self._log('⚠ "Landed Node" row not found in Node Position Deviation table', 'w')
+                return False
+
+            tcs = landed_row.findall('{%s}tc' % NS_W)
+            if len(tcs) < 3:
+                return False
+
+            def fill_cell(cell, value_text):
+                # Keep the cell's existing pPr (indent/banding) instead of
+                # dropping it — see the earlier Date/Author table-cell fix.
+                keep_pPr = None
+                for para in list(cell):
+                    if para.tag == '{%s}p' % NS_W:
+                        if keep_pPr is None:
+                            keep_pPr = para.find('{%s}pPr' % NS_W)
+                        cell.remove(para)
+                para = ET.Element('{%s}p' % NS_W)
+                if keep_pPr is not None:
+                    para.append(keep_pPr)
+                cell.append(para)
+                run = ET.SubElement(para, '{%s}r' % NS_W)
+                text_el = ET.SubElement(run, '{%s}t' % NS_W)
+                text_el.text = value_text
+
+            fill_cell(tcs[1], f'{easting:.3f}')
+            fill_cell(tcs[2], f'{northing:.3f}')
+
+            updated_xml = ET.tostring(root, encoding='utf-8')
+            with zipfile.ZipFile(docx_path, 'r') as zin, \
+                 zipfile.ZipFile(docx_path + '.tmp', 'w', zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == 'word/document.xml':
+                        zout.writestr(item, updated_xml)
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+            os.remove(docx_path)
+            os.rename(docx_path + '.tmp', docx_path)
+            return True
+        except Exception as e:
+            self._log(f'✗ Failed to fill Landed Node position: {e}', 'err')
+            return False
+
     def _generate_report(self):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         template_path = os.path.join(script_dir, REPORT_TEMPLATE)
@@ -1019,6 +1255,17 @@ class App(tk.Tk):
         try:
             self._build_report(template_path, out_path, photo1, photo2, fix_photo)
             self._log(f'✓ Generated report: {os.path.basename(out_path)}', 'ok')
+
+            # Landed Node position, if a UDP fix was captured for this event —
+            # filled unconditionally here (not gated behind Insert & Close),
+            # so it's present even if the Template Manager is just Cancelled.
+            fix = self._load_udp_fix(folder_path)
+            if fix:
+                if self._insert_landed_node_position(out_path, fix['easting'], fix['northing']):
+                    self._log(f'✓ Landed Node position filled: E={fix["easting"]:.3f} N={fix["northing"]:.3f}', 'ok')
+            else:
+                self._log('⚠ No UDP fix captured for this event — Landed Node position left blank', 'w')
+
             self.current_report_path = out_path
             self._open_template_manager(out_path, folder_path)
         except Exception as e:
@@ -1169,6 +1416,14 @@ class App(tk.Tk):
         # Extract FM number from folder path
         fm_number = self._extract_fm_number(folder_path)
 
+        # Pre-fill Line/Station/Node from the UDP fix captured for this
+        # event, if any — still editable/overridable, just no longer
+        # defaulting to '00001' when we actually already know the values.
+        udp_fix = self._load_udp_fix(folder_path)
+        line_default = str(udp_fix['line']) if udp_fix else '00001'
+        station_default = str(udp_fix['station']) if udp_fix else '00001'
+        node_default = str(udp_fix['node']) if udp_fix else '00001'
+
         # ── Title ──
         tk.Label(win, text='Engagement 10 Templates & Metadata', font=FB, bg=BG, fg=GREEN).pack(padx=12, pady=(12, 6), anchor='w')
 
@@ -1182,21 +1437,21 @@ class App(tk.Tk):
         line_frame = tk.Frame(meta_frame, bg=BG)
         line_frame.pack(fill='x', pady=3)
         tk.Label(line_frame, text='Line #:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
-        line_var = tk.StringVar(value='00001')
+        line_var = tk.StringVar(value=line_default)
         line_entry = tk.Entry(line_frame, textvariable=line_var, font=FM, bg=PANEL, fg=FG, width=10,
                               insertbackground=FG, relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
         line_entry.pack(side='left', padx=(0, 6))
 
         # Station number
         tk.Label(line_frame, text='Station #:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
-        station_var = tk.StringVar(value='00001')
+        station_var = tk.StringVar(value=station_default)
         station_entry = tk.Entry(line_frame, textvariable=station_var, font=FM, bg=PANEL, fg=FG, width=10,
                                  insertbackground=FG, relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
         station_entry.pack(side='left', padx=(0, 6))
 
         # Node number
         tk.Label(line_frame, text='Node #:', font=FM, bg=BG, fg=FG_DIM, width=12, anchor='w').pack(side='left')
-        node_var = tk.StringVar(value='00001')
+        node_var = tk.StringVar(value=node_default)
         node_entry = tk.Entry(line_frame, textvariable=node_var, font=FM, bg=PANEL, fg=FG, width=10,
                               insertbackground=FG, relief='flat', bd=0, highlightthickness=1, highlightbackground=BORDER)
         node_entry.pack(side='left')
