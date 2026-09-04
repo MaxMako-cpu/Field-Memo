@@ -355,18 +355,22 @@ class App(tk.Tk):
     #  UDP FIX LISTENER — one per UHD, port set in Settings
     # ══════════════════════════════════════════
     def _on_udp_port_changed(self, which):
-        self._save_config()
         # Debounced — the StringVar fires this on every keystroke, so typing
-        # "8808" would otherwise try to bind "8", "88", "880" along the way.
-        # Those are all under 1024 (Windows' privileged-port range), so a
-        # non-admin bind legitimately fails with WinError 10013 on each one.
-        # Wait until typing pauses before actually rebinding.
+        # "8808" would otherwise try to bind "8", "88", "880" along the way
+        # (all under 1024, Windows' privileged-port range — a non-admin bind
+        # legitimately fails with WinError 10013 on each one). Saving to
+        # config is deferred the same way: if the app were closed mid-type,
+        # saving on every keystroke could persist a broken partial port,
+        # which would then fail again on every future startup — bypassing
+        # this debounce entirely, since startup calls _restart_udp_listener
+        # directly. Wait until typing pauses before doing either.
         if self._udp_restart_job[which] is not None:
             self.after_cancel(self._udp_restart_job[which])
         self._udp_restart_job[which] = self.after(600, lambda: self._do_restart_udp_listener(which))
 
     def _do_restart_udp_listener(self, which):
         self._udp_restart_job[which] = None
+        self._save_config()
         self._restart_udp_listener(which)
 
     def _restart_udp_listener(self, which):
@@ -390,6 +394,10 @@ class App(tk.Tk):
             port = int(port_str)
         except ValueError:
             self._log(f'✗ Invalid UHD{which} UDP port: "{port_str}"', 'err')
+            return
+        if not (1024 <= port <= 65535):
+            self._log(f'✗ UHD{which} UDP port {port} is out of range — use 1024-65535 '
+                       f'(ports below 1024 are reserved by Windows and need admin rights)', 'err')
             return
 
         try:
