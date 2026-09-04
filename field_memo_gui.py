@@ -42,6 +42,15 @@ TEMPLATES_FILENAME = 'field_memo_templates.json'
 # if the app restarts in between.
 UDP_FIX_FILENAME = 'udp_fix.json'
 
+# SPS 2.1 receiver (pre-plot) positions, kept next to the script — the exact
+# filename carries the survey date/re-issue so it's matched by pattern, not
+# a fixed name; the newest match wins if more than one is present. Standard
+# fixed-width R record (verified against a real export): line cols 2-11,
+# station cols 12-21, easting cols 47-55, northing cols 56-65 — no Node ID
+# field exists in this format, so Design Position can only be looked up by
+# Line + Station, not by Node number.
+SPS_RECEIVER_GLOB = '*.r01'
+
 # OOXML namespaces used when editing the report's word/document.xml
 NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
@@ -1152,11 +1161,45 @@ class App(tk.Tk):
             self._log(f'✗ Failed to insert image: {e}', 'err')
             return False
 
-    def _insert_landed_node_position(self, docx_path, easting, northing):
-        """Fill the 'Landed Node' row's Easting/Northing cells in the
-        'Node Position Deviation' table (a separate table from the metadata
-        one _insert_template_into_docx edits) with the position captured
-        from the UHD's UDP fix."""
+    def _load_sps_design_positions(self):
+        """Parse the SPS 2.1 receiver (.r01) file next to the script into a
+        {(line, station): (easting, northing)} lookup for Design Position.
+        If more than one *.r01 is present, the most recently modified wins
+        (a re-issued positioning file replacing an older one)."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        matches = glob.glob(os.path.join(script_dir, SPS_RECEIVER_GLOB))
+        if not matches:
+            return {}
+        sps_path = max(matches, key=os.path.getmtime)
+
+        lookup = {}
+        try:
+            with open(sps_path, 'r', encoding='utf-8', errors='replace') as f:
+                for line in f:
+                    if not line.startswith('R') or len(line) < 65:
+                        continue
+                    try:
+                        ln = int(float(line[1:11].strip()))
+                        st = int(float(line[11:21].strip()))
+                        easting = float(line[46:55].strip())
+                        northing = float(line[55:65].strip())
+                    except (ValueError, IndexError):
+                        continue
+                    lookup[(ln, st)] = (easting, northing)
+        except Exception as e:
+            self._log(f'✗ Could not read SPS receiver file ({os.path.basename(sps_path)}): {e}', 'err')
+            return {}
+        return lookup
+
+    def _fill_node_position_table(self, docx_path, design=None, landed=None):
+        """Fill Easting/Northing cells in the 'Node Position Deviation'
+        table (a separate table from the metadata one
+        _insert_template_into_docx edits). design/landed are optional
+        (easting, northing) tuples — whichever is given gets written into
+        that row ('Design Position' from the SPS lookup / 'Landed Node'
+        from the UDP fix). Returns True if at least one row was filled."""
+        if design is None and landed is None:
+            return False
         try:
             with zipfile.ZipFile(docx_path, 'r') as z:
                 doc_xml_bytes = z.read('word/document.xml')
@@ -1178,21 +1221,14 @@ class App(tk.Tk):
                 self._log('⚠ "Node Position Deviation" table not found', 'w')
                 return False
 
-            landed_row = None
-            for row in target_table.findall('{%s}tr' % NS_W):
-                tcs = row.findall('{%s}tc' % NS_W)
-                if tcs:
-                    label = ''.join(t.text or '' for t in tcs[0].iter('{%s}t' % NS_W))
-                    if 'Landed' in label:
-                        landed_row = row
-                        break
-            if landed_row is None:
-                self._log('⚠ "Landed Node" row not found in Node Position Deviation table', 'w')
-                return False
-
-            tcs = landed_row.findall('{%s}tc' % NS_W)
-            if len(tcs) < 3:
-                return False
+            def find_row(label_substr):
+                for row in target_table.findall('{%s}tr' % NS_W):
+                    tcs = row.findall('{%s}tc' % NS_W)
+                    if tcs:
+                        label = ''.join(t.text or '' for t in tcs[0].iter('{%s}t' % NS_W))
+                        if label_substr in label:
+                            return row
+                return None
 
             def fill_cell(cell, value_text):
                 # Keep the cell's existing pPr (indent/banding) instead of
@@ -1211,8 +1247,24 @@ class App(tk.Tk):
                 text_el = ET.SubElement(run, '{%s}t' % NS_W)
                 text_el.text = value_text
 
-            fill_cell(tcs[1], f'{easting:.3f}')
-            fill_cell(tcs[2], f'{northing:.3f}')
+            any_filled = False
+            for label_substr, values in (('Design', design), ('Landed', landed)):
+                if values is None:
+                    continue
+                row = find_row(label_substr)
+                if row is None:
+                    self._log(f'⚠ "{label_substr}" row not found in Node Position Deviation table', 'w')
+                    continue
+                tcs = row.findall('{%s}tc' % NS_W)
+                if len(tcs) < 3:
+                    continue
+                easting, northing = values
+                fill_cell(tcs[1], f'{easting:.3f}')
+                fill_cell(tcs[2], f'{northing:.3f}')
+                any_filled = True
+
+            if not any_filled:
+                return False
 
             updated_xml = ET.tostring(root, encoding='utf-8')
             with zipfile.ZipFile(docx_path, 'r') as zin, \
@@ -1226,7 +1278,7 @@ class App(tk.Tk):
             os.rename(docx_path + '.tmp', docx_path)
             return True
         except Exception as e:
-            self._log(f'✗ Failed to fill Landed Node position: {e}', 'err')
+            self._log(f'✗ Failed to fill Node Position Deviation table: {e}', 'err')
             return False
 
     def _generate_report(self):
@@ -1256,15 +1308,31 @@ class App(tk.Tk):
             self._build_report(template_path, out_path, photo1, photo2, fix_photo)
             self._log(f'✓ Generated report: {os.path.basename(out_path)}', 'ok')
 
-            # Landed Node position, if a UDP fix was captured for this event —
-            # filled unconditionally here (not gated behind Insert & Close),
-            # so it's present even if the Template Manager is just Cancelled.
+            # Node Position Deviation table — filled unconditionally here
+            # (not gated behind Insert & Close), so it's present even if
+            # the Template Manager is just Cancelled:
+            #  - Landed Node: from the UDP fix captured at Complete Event.
+            #  - Design Position: looked up in the SPS receiver file by
+            #    that same fix's Line/Station (no Node ID exists in SPS).
             fix = self._load_udp_fix(folder_path)
+            landed = design = None
             if fix:
-                if self._insert_landed_node_position(out_path, fix['easting'], fix['northing']):
-                    self._log(f'✓ Landed Node position filled: E={fix["easting"]:.3f} N={fix["northing"]:.3f}', 'ok')
+                landed = (fix['easting'], fix['northing'])
+                design = self._load_sps_design_positions().get((fix['line'], fix['station']))
+                if design is None:
+                    self._log(f'⚠ No Design Position found in SPS file for '
+                               f'Line {fix["line"]} Station {fix["station"]}', 'w')
+
+            if landed or design:
+                if self._fill_node_position_table(out_path, design=design, landed=landed):
+                    parts = []
+                    if design:
+                        parts.append(f'Design E={design[0]:.3f} N={design[1]:.3f}')
+                    if landed:
+                        parts.append(f'Landed E={landed[0]:.3f} N={landed[1]:.3f}')
+                    self._log('✓ Node Position Deviation filled: ' + '; '.join(parts), 'ok')
             else:
-                self._log('⚠ No UDP fix captured for this event — Landed Node position left blank', 'w')
+                self._log('⚠ No UDP fix captured for this event — Node Position Deviation left blank', 'w')
 
             self.current_report_path = out_path
             self._open_template_manager(out_path, folder_path)
