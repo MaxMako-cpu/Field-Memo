@@ -51,6 +51,11 @@ UDP_FIX_FILENAME = 'udp_fix.json'
 # Line + Station, not by Node number.
 SPS_RECEIVER_GLOB = '*.r01'
 
+# Event folders hold more than photos — the UDP fix sidecar and the generated
+# report itself live there too — so photo identification must filter by
+# extension rather than treating every file as a candidate image.
+IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp')
+
 # OOXML namespaces used when editing the report's word/document.xml
 NS_W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
@@ -733,9 +738,17 @@ class App(tk.Tk):
         an event folder, using the naming convention _complete_event() set
         up: photo2 is the file prefixed 'Pre_', the fix photo is that same
         name minus the prefix, and whatever's left over is photo1. Any of
-        the three may come back None if it can't be determined."""
+        the three may come back None if it can't be determined.
+
+        Only image files are considered: the folder also holds the UDP fix
+        sidecar and (on a re-run) the generated report, and without this
+        filter one of those becomes "photo1" whenever the real UHD #1 photo
+        is missing — embedding its bytes as Figure 1 and silently skipping
+        the "could not identify all 3 photos" warning, since photo1 is
+        then non-None."""
         files = [f for f in os.listdir(folder_path)
-                 if os.path.isfile(os.path.join(folder_path, f))]
+                 if os.path.isfile(os.path.join(folder_path, f))
+                 and f.lower().endswith(IMAGE_EXTS)]
 
         pre_file = next((f for f in files if f.startswith('Pre_')), None)
         fix_file = None
