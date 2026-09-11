@@ -77,6 +77,85 @@ FT      = ('Courier New', 12, 'bold')
 
 FLASH_INTERVAL_MS = 500  # blink period while a button is armed/waiting for its second click
 
+# Help window contents — (heading, [body lines]) pairs. Lines are kept short
+# enough to wrap cleanly at the window's default width rather than relying on
+# word-wrap to break them in awkward places.
+HELP_SECTIONS = [
+    ('FIELD MEMO — HOW TO USE', None),
+    ('', None),
+    ('1. FIRST-TIME SETUP  (▶ SETTINGS)', [
+        'Fix Img / UHD333 / UHD334 — folder patterns for the NavView',
+        'photos. Use the … button to browse; keep the *.png on the end.',
+        'Dest — where the FM-### event folders get created.',
+        'UHD333 Port / UHD334 Port — the UDP ports NavView sends its',
+        'fixes on. Leave blank to turn that listener off.',
+        'Everything saves automatically — there is no Save button.',
+    ]),
+    ('2. LOGGING AN EVENT  (2 clicks)', [
+        'CLICK 1 — press UHD333 or UHD334:',
+        '    • creates FM-###-Position deviation in the Dest folder',
+        "    • copies the 'before' photo from that UHD",
+        '    • the button starts flashing and a Reason box opens',
+        '    • type a reason + Enter — the folder is renamed with it',
+        '',
+        'CLICK 2 — press the SAME flashing button again:',
+        "    • copies the 'after' photo, named Pre_<fix image name>",
+        '    • copies the latest Fix Image',
+        '    • captures the latest UDP fix for that UHD',
+        '',
+        'Only one event runs at a time — the other button stays',
+        'disabled until you finish the current one.',
+    ]),
+    ('3. UDP FIXES (automatic)', [
+        'NavView sends one line per fix:',
+        '    <timestamp>,easting,northing,line,station,node',
+        'The newest fix per UHD is written into the event folder as',
+        'udp_fix.json when you complete the event (click 2).',
+        '',
+        'If no fix arrived nothing breaks — you just type Line,',
+        'Station and Node in by hand and the position rows stay blank.',
+    ]),
+    ('4. GENERATE REPORT', [
+        'Builds the Word report for the HIGHEST-numbered FM-### folder.',
+        '    • Figures 1-3 — the three event photos',
+        '    • Figure 4 — left blank, you insert it yourself',
+        '    • Design Position — looked up in the .r01 survey file',
+        '      by Line + Station',
+        '    • Landed Node — taken from the captured UDP fix',
+        'The Template Manager then opens automatically.',
+    ]),
+    ('5. TEMPLATE MANAGER', [
+        'Click a template button to load its saved text into the box.',
+        'Edit it freely — Enter starts a new paragraph in Word too.',
+        'Edits are ONE-OFF; they do not change the saved template',
+        'unless you press Update Template.',
+        '',
+        'Author is required. Line / Station / Node come pre-filled',
+        'from the UDP fix — correct them if needed.',
+        '',
+        'Browse & Insert Image — puts a picture in as Figure 4.',
+        'Insert & Close — writes the text and metadata into the report.',
+        'Cancel — closes without inserting; the report is already saved.',
+    ]),
+    ('6. TEMPLATES BUTTON', [
+        'Add, edit or delete templates at any time, without having to',
+        'generate a report first.',
+    ]),
+    ('7. FILES THAT MUST SIT NEXT TO THE SCRIPT', [
+        'IFR-PXGEO-OBN-013626-.docx — the report template',
+        '*.r01 — the SPS survey file, used for Design Position',
+        '',
+        'Created automatically:',
+        'field_memo_config.json — your settings',
+        'field_memo_templates.json — your saved templates',
+    ]),
+    ('TROUBLESHOOTING', [
+        "'No photos found' — check the pattern in SETTINGS ends *.png",
+        "'unrecognized UDP string' — the log shows what actually arrived",
+        'Watch the log panel: green = ok, amber = warning, red = error.',
+    ]),
+]
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -116,6 +195,7 @@ class App(tk.Tk):
         self.active_uhd     = None
         self.current_folder = None
         self.reason_win     = None
+        self.help_win       = None
         self._flash_job      = None
         self._flash_on       = False
         self.current_report_path = None  # Stores path to generated report for template insertion
@@ -136,6 +216,11 @@ class App(tk.Tk):
         top = tk.Frame(self, bg=BG)
         top.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 4))
         tk.Label(top, text='⬡ FIELD MEMO', font=FT, bg=BG, fg=GREEN).pack(side='left')
+        tk.Button(top, text='Help', font=FM, bg=PANEL, fg=AMBER, relief='flat',
+                  bd=0, cursor='hand2', padx=10, pady=2,
+                  activebackground=BORDER, highlightthickness=1,
+                  highlightbackground=BORDER,
+                  command=self._open_help).pack(side='left', padx=(12, 0))
 
         # ── paths (collapsible — closed by default) ──
         # Always-visible path rows were the main thing forcing a wide
@@ -256,6 +341,60 @@ class App(tk.Tk):
         else:
             self.paths_toggle.configure(text='▶ SETTINGS')
             self.paths_body.grid_forget()
+
+    def _open_help(self):
+        """Scrollable how-to window; contents come from HELP_SECTIONS."""
+        # Reuse the window if it's already open, rather than stacking a new
+        # copy on every click of the Help button.
+        if self.help_win is not None and self.help_win.winfo_exists():
+            self.help_win.lift()
+            self.help_win.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title('Field Memo — Help')
+        win.configure(bg=BG)
+        win.geometry('760x620')
+        win.minsize(520, 400)
+        self.help_win = win
+
+        tk.Label(win, text='⬡  FIELD MEMO — HELP', font=FT, bg=BG, fg=GREEN
+                 ).pack(padx=14, pady=(12, 2), anchor='w')
+        tk.Label(win, text='Position Deviation Photo Logger — quick reference',
+                 font=FM, bg=BG, fg=FG_DIM).pack(padx=14, pady=(0, 8), anchor='w')
+
+        frame = tk.Frame(win, bg=BG)
+        frame.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+        sb = tk.Scrollbar(frame, bg=BORDER, troughcolor=BG, relief='flat')
+        sb.pack(side='right', fill='y')
+        txt = tk.Text(frame, font=FM, bg=PANEL, fg=FG, relief='flat', bd=0,
+                      highlightthickness=1, highlightbackground=BORDER,
+                      wrap='word', yscrollcommand=sb.set, padx=10, pady=8)
+        txt.pack(side='left', fill='both', expand=True)
+        sb.config(command=txt.yview)
+
+        txt.tag_config('h1', foreground=GREEN, font=FB, spacing1=6, spacing3=4)
+        txt.tag_config('body', foreground=FG, spacing3=1)
+        txt.tag_config('dim', foreground=FG_DIM)
+
+        for heading, lines in HELP_SECTIONS:
+            if heading:
+                txt.insert('end', heading + '\n', 'h1')
+            if lines:
+                for ln in lines:
+                    txt.insert('end', ln + '\n',
+                               'dim' if ln.strip().startswith('•') else 'body')
+                txt.insert('end', '\n')
+        txt.configure(state='disabled')
+
+        def close():
+            self.help_win = None
+            win.destroy()
+
+        win.protocol('WM_DELETE_WINDOW', close)
+        tk.Button(win, text='Close', font=FM, bg=GREEN, fg='#000', relief='flat',
+                  bd=0, cursor='hand2', padx=14, pady=3,
+                  command=close).pack(pady=(0, 12))
 
     # ══════════════════════════════════════════
     #  LOG
