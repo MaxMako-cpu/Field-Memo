@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import json
+import math
 import shutil
 import socket
 import threading
@@ -62,18 +63,35 @@ NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 DOCX_NS = {'w': NS_W, 'a': NS_A, 'r': NS_R}
 
-BG      = '#0d0f14'
-PANEL   = '#13161e'
-BORDER  = '#1e2330'
-FG      = '#c8cfe0'
-FG_DIM  = '#4a5270'
-GREEN   = '#00e676'
-AMBER   = '#ffb300'
-RED     = '#ff1744'
-YELLOW  = '#ffd600'   # Generate Report button — distinct from AMBER's warning connotation
-FM      = ('Courier New', 9)
-FB      = ('Courier New', 11, 'bold')
-FT      = ('Courier New', 12, 'bold')
+# ── subsea palette ──
+# Deep-water blues/teals with a bioluminescent cyan accent. GREEN/AMBER/RED
+# keep their original meanings in the log (ok / warning / error) so the
+# colour language of every existing _log() call still reads the same.
+BG      = '#031218'   # abyss — window background
+PANEL   = '#07202b'   # raised panel / settings bar
+BORDER  = '#0f4658'   # panel edge
+LOGBG   = '#03151d'   # log well, a shade below BG
+BTNBG   = '#08222d'   # UHD button face
+FG      = '#d2f2f7'   # primary text — light filtering through water
+FG_DIM  = '#4b8090'   # secondary text
+CYAN    = '#25e8ff'   # accent — scope, headings, TEMPLATES
+GREEN   = '#39ffb0'   # aqua — "ok" in the log, UHD334, flash colour
+AMBER   = '#ffcf5c'   # warnings, HELP, GENERATE REPORT
+RED     = '#ff6b7f'   # coral — errors, UHD333
+YELLOW  = AMBER       # kept as an alias: older call sites still reference it
+FM      = ('Consolas', 9)
+FB      = ('Consolas', 11, 'bold')
+FT      = ('Consolas', 12, 'bold')
+
+HEADER_H = 112        # canvas header height (sonar scope + title + status LEDs)
+
+
+def _mix(a, b, t):
+    """Blend two #rrggbb colours. Tkinter has no alpha, so gradients and the
+    scope's fading sweep are built by pre-blending against the background."""
+    ca = tuple(int(a.lstrip('#')[i:i + 2], 16) for i in (0, 2, 4))
+    cb = tuple(int(b.lstrip('#')[i:i + 2], 16) for i in (0, 2, 4))
+    return '#%02x%02x%02x' % tuple(int(ca[i] + (cb[i] - ca[i]) * t) for i in range(3))
 
 FLASH_INTERVAL_MS = 500  # blink period while a button is armed/waiting for its second click
 
@@ -212,15 +230,24 @@ class App(tk.Tk):
         self.grid_rowconfigure(2, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
-        # ── title ──
-        top = tk.Frame(self, bg=BG)
-        top.grid(row=0, column=0, sticky='ew', padx=10, pady=(10, 4))
-        tk.Label(top, text='⬡ FIELD MEMO', font=FT, bg=BG, fg=GREEN).pack(side='left')
-        tk.Button(top, text='Help', font=FM, bg=PANEL, fg=AMBER, relief='flat',
-                  bd=0, cursor='hand2', padx=10, pady=2,
-                  activebackground=BORDER, highlightthickness=1,
-                  highlightbackground=BORDER,
-                  command=self._open_help).pack(side='left', padx=(12, 0))
+        # ── header ──
+        # A Canvas, because the gradient and the sonar scope can't be drawn
+        # with ordinary widgets. Everything BELOW the header stays a normal
+        # widget, so the window resizes and the UHD buttons flash exactly as
+        # they did before — only the header is redrawn on <Configure>.
+        self.header = tk.Canvas(self, height=HEADER_H, bg=BG,
+                                highlightthickness=0, bd=0)
+        self.header.grid(row=0, column=0, sticky='ew')
+        self.header.bind('<Configure>', lambda e: self._draw_header())
+
+        # The Help button stays a real widget parked on the canvas — native
+        # hover/click behaviour for free, no hit-testing to maintain.
+        self.help_btn = tk.Button(self.header, text='HELP', font=FM, bg=PANEL,
+                                  fg=AMBER, relief='flat', bd=0, cursor='hand2',
+                                  padx=10, pady=2, activebackground=BORDER,
+                                  highlightthickness=1,
+                                  highlightbackground=_mix(PANEL, AMBER, .5),
+                                  command=self._open_help)
 
         # ── paths (collapsible — closed by default) ──
         # Always-visible path rows were the main thing forcing a wide
@@ -287,9 +314,10 @@ class App(tk.Tk):
         lf.grid_rowconfigure(0, weight=1)
         lf.grid_columnconfigure(0, weight=1)
 
-        self.log_box = tk.Text(lf, font=FM, bg=PANEL, fg=FG, insertbackground=FG,
+        self.log_box = tk.Text(lf, font=FM, bg=LOGBG, fg=FG, insertbackground=FG,
                                 relief='flat', bd=0, highlightthickness=1,
-                                highlightbackground=BORDER, state='disabled', wrap='word')
+                                highlightbackground=BORDER, state='disabled', wrap='word',
+                                padx=8, pady=6)
         self.log_box.grid(row=0, column=0, sticky='nsew')
         sb = tk.Scrollbar(lf, command=self.log_box.yview, bg=BORDER, troughcolor=BG, relief='flat')
         sb.grid(row=0, column=1, sticky='ns')
@@ -305,15 +333,17 @@ class App(tk.Tk):
         bot.columnconfigure(1, weight=1)
 
         self.btn_uhd333 = tk.Button(
-            bot, text='UHD333', font=FB, bg=PANEL, fg=RED,
+            bot, text='UHD333', font=FB, bg=BTNBG, fg=RED,
             activebackground=BORDER, relief='flat', bd=0, cursor='hand2',
-            pady=10, command=lambda: self._on_uhd_click('333'))
+            pady=12, highlightthickness=1, highlightbackground=_mix(BTNBG, RED, .5),
+            command=lambda: self._on_uhd_click('333'))
         self.btn_uhd333.grid(row=0, column=0, sticky='ew', padx=(0, 4))
 
         self.btn_uhd334 = tk.Button(
-            bot, text='UHD334', font=FB, bg=PANEL, fg=GREEN,
+            bot, text='UHD334', font=FB, bg=BTNBG, fg=GREEN,
             activebackground=BORDER, relief='flat', bd=0, cursor='hand2',
-            pady=10, command=lambda: self._on_uhd_click('334'))
+            pady=12, highlightthickness=1, highlightbackground=_mix(BTNBG, GREEN, .5),
+            command=lambda: self._on_uhd_click('334'))
         self.btn_uhd334.grid(row=0, column=1, sticky='ew', padx=(4, 0))
 
         self._buttons = {'333': self.btn_uhd333, '334': self.btn_uhd334}
@@ -323,15 +353,15 @@ class App(tk.Tk):
         bottom_row.grid(row=4, column=0, sticky='ew', padx=10, pady=(0, 8))
         bottom_row.columnconfigure(0, weight=1)  # spacer — pushes both buttons to the right
 
-        tk.Button(bottom_row, text='GENERATE REPORT', font=FM, bg=BORDER, fg=YELLOW,
-                  relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
-                  command=self._generate_report).grid(row=0, column=1, padx=(0, 6))
-        tk.Button(bottom_row, text='TEMPLATES', font=FM, bg=BORDER, fg=AMBER,
-                  relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
-                  command=self._open_template_editor).grid(row=0, column=2, padx=(0, 6))
-        tk.Button(bottom_row, text='CLR LOG', font=FM, bg=BORDER, fg='#ffffff',
-                  relief='flat', bd=0, cursor='hand2', padx=8, pady=3,
-                  command=self._clear_log).grid(row=0, column=3)
+        for col, (label, colour, cmd) in enumerate((
+                ('GENERATE REPORT', AMBER, self._generate_report),
+                ('TEMPLATES', CYAN, self._open_template_editor),
+                ('CLR LOG', FG_DIM, self._clear_log)), start=1):
+            tk.Button(bottom_row, text=label, font=FM, bg=PANEL, fg=colour,
+                      relief='flat', bd=0, cursor='hand2', padx=10, pady=4,
+                      activebackground=BORDER, highlightthickness=1,
+                      highlightbackground=_mix(PANEL, colour, .4),
+                      command=cmd).grid(row=0, column=col, padx=(0, 6))
 
     def _toggle_paths(self):
         self._paths_open = not self._paths_open
@@ -341,6 +371,64 @@ class App(tk.Tk):
         else:
             self.paths_toggle.configure(text='▶ SETTINGS')
             self.paths_body.grid_forget()
+
+    def _status_leds(self):
+        """Live state behind the header LEDs. All four are things the app can
+        genuinely check, so a dark LED always means something real is off."""
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        return [
+            ('UHD333', self.udp_sockets.get('333') is not None),
+            ('UHD334', self.udp_sockets.get('334') is not None),
+            ('SPS .r01', bool(glob.glob(os.path.join(script_dir, SPS_RECEIVER_GLOB)))),
+            ('TEMPLATE', os.path.isfile(os.path.join(script_dir, REPORT_TEMPLATE))),
+        ]
+
+    def _draw_header(self):
+        """Repaint the canvas header. Called on every <Configure>, so all
+        right-hand positions are derived from the current width."""
+        c = self.header
+        w = c.winfo_width()
+        if w <= 1:
+            return  # not laid out yet
+        c.delete('all')
+        for i in range(HEADER_H):
+            c.create_line(0, i, w, i, fill=_mix('#052635', BG, i / HEADER_H))
+
+        # Sonar scope — deliberately static. Animating the sweep would mean a
+        # permanent redraw timer running on a field laptop for no extra info.
+        cx, cy, R = 60, 56, 42
+        for rr in range(R, 6, -11):
+            c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, outline=_mix(BG, CYAN, .22))
+        c.create_line(cx - R, cy, cx + R, cy, fill=_mix(BG, CYAN, .16))
+        c.create_line(cx, cy - R, cx, cy + R, fill=_mix(BG, CYAN, .16))
+        for i in range(24):
+            a = math.radians(-40 - i * 3.4)
+            c.create_line(cx, cy, cx + R * math.cos(a), cy + R * math.sin(a),
+                          fill=_mix(BG, GREEN, .55 * (1 - i / 24)))
+        for bx, by, s in ((18, -14, 3), (-24, 10, 2), (11, 24, 2)):
+            c.create_oval(cx + bx - s, cy + by - s, cx + bx + s, cy + by + s,
+                          fill=GREEN, outline='')
+        c.create_oval(cx - R, cy - R, cx + R, cy + R, outline=CYAN)
+
+        c.create_text(118, 40, text='FIELD MEMO', fill=FG,
+                      font=('Consolas', 17, 'bold'), anchor='w')
+        c.create_text(120, 62, text='SUBSEA POSITION DEVIATION LOGGER',
+                      fill=FG_DIM, font=('Consolas', 8), anchor='w')
+        c.create_text(120, 79, text='ENGAGEMENT 10 · OBN-013626',
+                      fill=_mix(FG_DIM, CYAN, .4), font=('Consolas', 8), anchor='w')
+
+        # Drop the right-hand cluster on narrow windows instead of letting it
+        # collide with the title.
+        if w > 470:
+            c.create_window(w - 54, 34, window=self.help_btn)
+            for i, (lbl, ok) in enumerate(self._status_leds()):
+                x = w - 232 + (i % 2) * 116
+                y = 62 + (i // 2) * 18
+                c.create_oval(x, y, x + 6, y + 6,
+                              fill=GREEN if ok else _mix(BG, RED, .75), outline='')
+                c.create_text(x + 12, y + 3, text=lbl, fill=FG_DIM,
+                              font=('Consolas', 8), anchor='w')
+        c.create_line(0, HEADER_H - 1, w, HEADER_H - 1, fill=BORDER)
 
     def _open_help(self):
         """Scrollable how-to window; contents come from HELP_SECTIONS."""
@@ -517,7 +605,20 @@ class App(tk.Tk):
         self._save_config()
         self._restart_udp_listener(which)
 
+    def _refresh_header(self):
+        """Repaint the header so the status LEDs reflect current state."""
+        if getattr(self, 'header', None) is not None:
+            self._draw_header()
+
     def _restart_udp_listener(self, which):
+        # Wrapper so the header LEDs refresh however _bind_udp_listener exits —
+        # it returns early on 'no port', a bad port, and a failed bind.
+        try:
+            self._bind_udp_listener(which)
+        finally:
+            self._refresh_header()
+
+    def _bind_udp_listener(self, which):
         """(Re)start the UDP listener thread for one UHD, closing any
         previous socket/thread for it first. Called on startup and whenever
         that UHD's port field changes."""
@@ -773,7 +874,7 @@ class App(tk.Tk):
 
     def _enable_both_buttons(self):
         for key, btn in self._buttons.items():
-            btn.configure(state='normal', bg=PANEL, fg=self._idle_fg[key])
+            btn.configure(state='normal', bg=BTNBG, fg=self._idle_fg[key])
 
     def _start_flash(self, which):
         self._flash_on = False
@@ -785,14 +886,14 @@ class App(tk.Tk):
         if self._flash_on:
             btn.configure(bg=GREEN, fg='#000')
         else:
-            btn.configure(bg=PANEL, fg=self._idle_fg[which])
+            btn.configure(bg=BTNBG, fg=self._idle_fg[which])
         self._flash_job = self.after(FLASH_INTERVAL_MS, lambda: self._do_flash(which))
 
     def _stop_flash(self, which):
         if self._flash_job is not None:
             self.after_cancel(self._flash_job)
             self._flash_job = None
-        self._buttons[which].configure(bg=PANEL, fg=self._idle_fg[which])
+        self._buttons[which].configure(bg=BTNBG, fg=self._idle_fg[which])
 
     # ══════════════════════════════════════════
     #  REASON PROMPT — non-modal, doesn't block clicking the flashing button
